@@ -1,16 +1,24 @@
 # device-setup
 
-Bootstrap script for a macOS dev machine. One file does the work — `setup.sh` —
-plus an `nvim/` overlay it copies over the LazyVim starter.
+Bootstrap for a macOS dev machine, plus an `nvim/` overlay it copies over the
+LazyVim starter.
+
+Two commands, with a clear division of labour:
 
 ```sh
 git clone git@github.com:<you>/device-setup.git
 cd device-setup
-./setup.sh
+./setup.sh     # once, on a machine that has nothing
+apply          # from then on, from anywhere
 ```
 
-Safe to re-run. Every step checks for an existing install first, and every line
-added to a shell config is added only once.
+`setup.sh` installs the things that can't install themselves — Homebrew, Oh My
+Zsh, rustup, the LazyVim starter — and needs sudo to do it. `apply` pulls this
+repo and installs anything newly declared. No sudo, no prompts, cheap when
+there's nothing to do. It's `bin/apply`, symlinked into `~/.local/bin`.
+
+Both are safe to re-run: every step checks for an existing install first, and
+every line added to a shell config is added only once.
 
 ## What it installs
 
@@ -27,6 +35,81 @@ added to a shell config is added only once.
 
 It also links the shell config and the scripts in `bin/` into place — see
 [Shell config](#shell-config) below.
+
+## Adding a tool
+
+One line in `lib/packages.sh`:
+
+```sh
+brew_formula hyperfine        # benchmarking
+uv_tool     pre-commit
+cargo_crate some-crate  itsbinary
+```
+
+Commit it, and every other machine says so at its next shell prompt:
+
+```
+* 1 declared package(s) not installed — run apply
+```
+
+That notice is the point of the layout. `lib/packages.sh` is the single list of
+what should be installed, and three different things read it:
+
+| | |
+|---|---|
+| `setup.sh` | bootstraps a bare machine, then installs whatever is missing |
+| `bin/apply` | reconciles a machine that already exists |
+| `zsh/rc.zsh` | notices at startup that something isn't installed, and says so |
+
+**Declaration is separated from installation.** Sourcing `lib/packages.sh` only
+*probes* — it never installs, never touches the network, and never forks a
+process. Every probe is a shell builtin (zsh's `$commands` hash, or `[[ -e ]]`
+for the handful of things it can't see), so the whole file costs about 0.5ms and
+an interactive shell can afford to run it on every startup. The install half
+lives in `lib/reconcile.sh` and runs only from `setup.sh` and `apply`.
+
+Without that split, an installer that only ever ran once is the only record of
+what a machine should have — so a tool added on the laptop is just quietly
+absent on the desktop until someone remembers to re-run it.
+
+| File | Holds |
+|---|---|
+| `lib/packages.sh` | what should be installed. Declaration only; bash- and zsh-safe |
+| `lib/reconcile.sh` | how to install it, plus the symlinks and the nvim overlay |
+| `lib/common.sh` | output helpers shared by `setup.sh` and `apply` |
+
+A few tools aren't one-line declarations and live in `lib/reconcile.sh` instead:
+`juliaup`, because "installed" has two levels there — the tool, then a channel.
+
+### Probes
+
+The default probe for a package is its own name. Two entries override it with an
+absolute path, because macOS ships its own copy under `/usr/bin` and the bare
+name would resolve on a machine that never got Homebrew's newer one:
+
+```sh
+brew_formula git "$SETUP_BREW_PREFIX/bin/git"   # /usr/bin/git always exists
+brew_formula jq  "$SETUP_BREW_PREFIX/bin/jq"    # macOS 26 ships jq 1.7.1-apple
+```
+
+Casks get the same treatment by default — they rarely put anything on `PATH`, so
+the probe is the Caskroom entry Homebrew creates for every installed cask.
+
+## apply
+
+```sh
+apply              # pull, then install anything declared but missing
+apply -u           # ...and upgrade what's already installed first
+apply --skip-pull  # leave git alone
+```
+
+`apply` re-execs itself after the pull. Without that, a run that fetched a
+change to `apply`, `lib/packages.sh`, or `lib/reconcile.sh` would go on using
+the code that was on disk when it started, and the change wouldn't take effect
+until the *next* run.
+
+A failed pull — dirty tree, unreachable remote — is a warning, not an abort. It
+still reconciles against the checkout you have.
 
 ## Shell config
 
@@ -74,8 +157,9 @@ GitHub repo.
 git clone <this repo> ~/dev/setup && cd ~/dev/setup && ./setup.sh
 ```
 
-After that, syncing a shell change is `git pull`. Nothing to re-run — the
-symlink already points at the updated file.
+After that, syncing a shell change is `git pull` — nothing to re-run, the
+symlink already points at the updated file. Syncing a *package* change is
+`apply`, which does the pull for you.
 
 ## The nvim/ overlay
 

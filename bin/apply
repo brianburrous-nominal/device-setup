@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+#
+# apply — reconcile this machine against the repo.
+#
+# Run ./setup.sh once, on a machine that has nothing. Run `apply` from then on.
+#
+# The split: setup.sh bootstraps the things that can't bootstrap themselves —
+# Homebrew, Oh My Zsh, rustup, the LazyVim starter — and needs sudo to do it.
+# apply assumes all of that already exists and only reconciles what the repo
+# declares: the packages in lib/packages.sh, plus the symlinks and the nvim
+# overlay. No sudo, no prompts, cheap when there's nothing to do.
+#
+#   apply              pull the repo, then install anything declared but missing
+#   apply -u           ...and upgrade everything already installed first
+#   apply --skip-pull  leave git alone (used by the self re-exec below)
+#
+# setup.sh symlinks this into ~/.local/bin, so it's `apply` from anywhere.
+
+set -euo pipefail
+
+# Resolve through the ~/.local/bin symlink to find the repo. macOS's readlink
+# only grew -f recently and this has to work where it hasn't, so walk the chain
+# by hand rather than reaching for `readlink -f`.
+self="${BASH_SOURCE[0]}"
+while [[ -L "$self" ]]; do
+  self_dir="$(cd -P "$(dirname "$self")" && pwd)"
+  self="$(readlink "$self")"
+  [[ "$self" == /* ]] || self="$self_dir/$self"
+done
+SETUP_REPO_DIR="$(cd -P "$(dirname "$self")/.." && pwd)"
+
+usage() {
+  cat <<'USAGE'
+usage: apply [-u|--update] [--skip-pull]
+
+  -u, --update   upgrade already-installed packages too (brew, uv, rustup, juliaup)
+      --skip-pull  don't git pull first
+USAGE
+}
+
+update=0
+skip_pull=0
+for arg in "$@"; do
+  case "$arg" in
+    -u | --update) update=1 ;;
+    --skip-pull) skip_pull=1 ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+# shellcheck source=lib/common.sh
+source "$SETUP_REPO_DIR/lib/common.sh"
+
+# apply may run from a context where .zprofile never did — cron, a login-less
+# shell, a fresh terminal before `exec zsh`.
+load_brew || die "Homebrew not found. Run ./setup.sh first."
+load_cargo
+
+# ---------------------------------------------------------------------------
+# Pull, then re-exec the version we just pulled.
+#
+# Without the re-exec, a run that fetches a change to apply itself, to
+# lib/packages.sh, or to lib/reconcile.sh would go on using the logic that was
+# on disk when it started — so the change wouldn't take effect until the *next*
+# run. --skip-pull is what stops this from recursing.
+# ---------------------------------------------------------------------------
+if ((skip_pull == 0)); then
+  step "Repo"
+  if [[ -d "$SETUP_REPO_DIR/.git" ]]; then
+    if git -C "$SETUP_REPO_DIR" pull --rebase; then
+      ok "up to date with origin"
+      args=(--skip-pull)
+      ((update == 0)) || args+=(-u)
+      exec "$SETUP_REPO_DIR/bin/apply" "${args[@]}"
+    fi
+    # A dirty tree or an unreachable remote shouldn't stop us reconciling
+    # against the checkout we already have.
+    warn "pull failed; reconciling against the working tree as-is"
+  else
+    skip "$SETUP_REPO_DIR is not a git checkout"
+  fi
+fi
+
+# shellcheck source=lib/packages.sh
+source "$SETUP_REPO_DIR/lib/packages.sh"
+# shellcheck source=lib/reconcile.sh
+source "$SETUP_REPO_DIR/lib/reconcile.sh"
+
+((update == 0)) || upgrade_everything
+
+install_missing_packages
+reconcile_julia
+apply_nvim_overlay
+link_shell_config
+link_repo_bin
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+step "Finished"
+# Re-probe rather than trusting the counts from before the installs. `hash -r`
+# clears bash's memo of command lookups so binaries installed a moment ago are
+# actually found.
+hash -r
+unset SETUP_PACKAGES_SOURCED
+# shellcheck source=lib/packages.sh
+source "$SETUP_REPO_DIR/lib/packages.sh"
+
+if ((SETUP_MISSING_COUNT == 0)); then
+  ok "$SETUP_DECLARED_COUNT declared packages installed, config linked"
+else
+  warn "$SETUP_MISSING_COUNT of $SETUP_DECLARED_COUNT declared packages still missing:"
+  printf '      %s\n' \
+    ${MISSING_BREW_FORMULAE[@]+"${MISSING_BREW_FORMULAE[@]}"} \
+    ${MISSING_BREW_CASKS[@]+"${MISSING_BREW_CASKS[@]}"} \
+    ${MISSING_UV_TOOLS[@]+"${MISSING_UV_TOOLS[@]}"} \
+    ${MISSING_CARGO_CRATES[@]+"${MISSING_CARGO_CRATES[@]}"}
+fi
+echo

@@ -121,3 +121,38 @@ rgv() {
     rm -f "$qf"
   fi
 }
+
+# ── package drift ────────────────────────────────────────────────────────────
+# The other half of the declare/install split. lib/packages.sh in the setup repo
+# is the single list of what should be installed; sourcing it here probes for
+# each entry and counts what's absent. It never installs anything -- shell
+# startup only ever *reports*, and `apply` is what acts.
+#
+# That's what makes adding a tool one line: declare it in lib/packages.sh on one
+# machine, and every other machine says "run apply" the next time you open a
+# shell, instead of silently lacking it until someone re-runs the installer.
+#
+# Cheap enough to do unconditionally: every probe is a builtin (zsh's $commands
+# hash, or [[ -e ]] for the few things it can't see), which measures ~0.5ms for
+# the whole file. Deliberately last in this file so the probes see the PATH set
+# at the top.
+#
+# ${(%):-%N} is this file's own path; :A resolves the ~/.config/zsh/rc.zsh
+# symlink back to the repo, so this works wherever the repo is cloned.
+# The argument, not a local: %N inside a function is the *function* name, and
+# for an anonymous one that's the literal string "(anon)".
+() {
+  local repo="$1"
+  [[ -r "$repo/lib/packages.sh" ]] || return 0
+
+  source "$repo/lib/packages.sh"
+  (( SETUP_MISSING_COUNT == 0 )) || print -P \
+    "%F{cyan}*%f ${SETUP_MISSING_COUNT} declared package(s) not installed — run %Bapply%b"
+
+  # Sourced files leak their names into the interactive shell; don't make the
+  # user tab-complete a DSL they'll never call by hand.
+  unfunction pkg_present brew_formula brew_cask uv_tool cargo_crate 2>/dev/null
+  unset SETUP_PACKAGES_SOURCED SETUP_BREW_PREFIX SETUP_DECLARED_COUNT \
+    SETUP_MISSING_COUNT MISSING_BREW_FORMULAE MISSING_BREW_CASKS \
+    MISSING_UV_TOOLS MISSING_CARGO_CRATES MISSING_BREW_TAPS
+} "${${(%):-%N}:A:h:h}"
