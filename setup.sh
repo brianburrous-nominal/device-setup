@@ -16,6 +16,8 @@
 #
 #   lib/packages.sh   what should be installed (declaration only; never installs)
 #   lib/reconcile.sh  how to install it, plus the symlinks and the nvim overlay
+#   lib/managers.sh   how each package manager installs and upgrades
+#   lib/catalog.sh    what each tool is and how to use it; what `jarvis` shows
 #   lib/common.sh     output helpers shared by setup.sh and apply
 #
 # Shell config lives in zsh/rc.zsh in this repo, symlinked into place. ~/.zshrc
@@ -279,14 +281,17 @@ cat <<EOF
        Profiles > Text > Font). Nothing else here installs it for you, and
        without it every LazyVim icon renders as an empty box.
     2. exec zsh              # or open a new terminal
-    3. atuin import auto     # pull your existing shell history in
-    4. nomp                  # set up a nomctl profile (needs a token)
-    5. nvim                  # then :LazyHealth to check the setup
-    6. ls / lsa / lt / lta, z <dir> to jump, try <name> for a scratch dir
-       rgv <pattern> to search-and-edit, jupyter-lab for notebooks
+    3. jarvis                # every tool above, with docs and examples
+    4. atuin import auto     # pull your existing shell history in
+    5. nomp                  # set up a nomctl profile (needs a token)
+    6. nvim                  # then :LazyHealth to check the setup
 
   Your SSH key, GitHub login, and git identity are already done -- the step
   above set them up. Re-run just that part any time with \`identity\`.
+
+  \`jarvis\` is the front door to everything listed above: one browsable list
+  with what each tool is for and what to type, whichever package manager
+  installed it. \`jarvis upgrade\` updates them all.
 
   From here on the command is \`apply\`, not this script. It pulls the repo and
   installs anything newly declared in lib/packages.sh; \`apply -u\` upgrades

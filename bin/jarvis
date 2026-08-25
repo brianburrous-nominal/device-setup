@@ -1,0 +1,1051 @@
+#!/usr/bin/env zsh
+#
+# jarvis — the home page for everything this repo puts on the machine.
+#
+#   jarvis                 browse every tool, grouped, with docs and examples
+#   jarvis list [category] the same list as plain text
+#   jarvis show <tool>     one tool in full
+#   jarvis search <query>  find a tool by name, summary or description
+#   jarvis status          what's installed and what isn't, per manager
+#   jarvis install [tool]  install what's missing, or one named tool
+#   jarvis upgrade [mgr]   upgrade every manager on the machine, or just some
+#   jarvis doctor          check the catalog, the registry and the machine agree
+#
+# The point of it is that you shouldn't have to remember which manager owns
+# what. A brew formula, a uv tool, a cargo crate, a script in bin/ and an alias
+# in zsh/rc.zsh all look the same in the list, and `jarvis install` works out
+# where a tool comes from rather than making you name it.
+#
+# Three files behind it, each with one job:
+#
+#   lib/catalog.sh   what every tool is, and what to type — the docs
+#   lib/packages.sh  what should be installed — the registry, shared with
+#                    setup.sh, apply and shell startup
+#   lib/managers.sh  how each manager installs and upgrades — shared with
+#                    lib/reconcile.sh, so apply and jarvis can't disagree
+#
+# zsh rather than bash, for the same reason bin/netif is: this is a TUI, and
+# macOS ships zsh 5.9 unconditionally while /bin/bash is still 3.2.
+
+emulate -L zsh
+setopt no_nomatch
+set -uo pipefail
+
+# ${0:A} resolves symlinks, so this finds the repo rather than the
+# ~/.local/bin/jarvis symlink and keeps working through it.
+SELF=${0:A}
+SETUP_REPO_DIR=${SELF:h:h}
+
+# shellcheck source=lib/common.sh
+source "$SETUP_REPO_DIR/lib/common.sh"
+# shellcheck source=lib/managers.sh
+source "$SETUP_REPO_DIR/lib/managers.sh"
+# shellcheck source=lib/catalog.sh
+source "$SETUP_REPO_DIR/lib/catalog.sh"
+
+DIM=$'\033[2m'
+CYAN=$'\033[36m'
+
+RC_LINK="$HOME/.config/zsh/rc.zsh"
+LOCAL_BIN="$HOME/.local/bin"
+
+# ── Loading the catalog ──────────────────────────────────────────────────────
+# The flat records lib/catalog.sh builds are dual-shell, which rules out
+# associative arrays there. Here they're unpacked into some, once, so that every
+# lookup afterwards is by name instead of a scan.
+
+typeset -gA C_CAT C_MGR C_PROBE C_SUM C_DETAIL C_EX C_LINK C_REL C_NOTE
+typeset -gA CAT_TITLE CAT_BLURB
+typeset -ga C_NAMES CAT_KEYS
+
+catalog_load() {
+  local rec name
+  local -a f
+  for rec in "${JARVIS_CATEGORIES[@]}"; do
+    f=("${(@ps:$JARVIS_FS:)rec}")
+    CAT_KEYS+=("$f[1]")
+    CAT_TITLE[$f[1]]="$f[2]"
+    CAT_BLURB[$f[1]]="$f[3]"
+  done
+  for rec in "${JARVIS_CATALOG[@]}"; do
+    f=("${(@ps:$JARVIS_FS:)rec}")
+    name="$f[1]"
+    C_NAMES+=("$name")
+    C_CAT[$name]="$f[2]"
+    C_MGR[$name]="$f[3]"
+    C_PROBE[$name]="$f[4]"
+    C_SUM[$name]="$f[5]"
+    C_DETAIL[$name]="$f[6]"
+    C_EX[$name]="$f[7]"
+    C_LINK[$name]="$f[8]"
+    C_REL[$name]="$f[9]"
+    C_NOTE[$name]="${f[10]:-}"
+  done
+}
+
+# The registry, for install status and for doctor. Sourced after the catalog so
+# that a name clash would be caught here rather than corrupting the docs.
+packages_load() {
+  [[ -n "${SETUP_PACKAGES_LOADED:-}" ]] && return 0
+  SETUP_RECORD_DECLARED=1
+  # shellcheck source=lib/packages.sh
+  source "$SETUP_REPO_DIR/lib/packages.sh"
+  SETUP_PACKAGES_LOADED=1
+}
+
+# ── Install status ───────────────────────────────────────────────────────────
+# Three different questions wearing the same hat. A package is installed if its
+# probe resolves. A script in bin/ is installed if apply has symlinked it into
+# ~/.local/bin — the file existing in the repo doesn't make it a command. An
+# alias or function is installed if rc.zsh is linked, and additionally if
+# whatever it wraps is there: the `ls` alias without eza is a broken command,
+# not a present one.
+
+tool_installed() {
+  local name=$1 spec probe mgr pkg
+  spec="${C_MGR[$name]:-}"
+  mgr="${spec%%:*}"
+  pkg="${spec#*:}"
+  [[ "$pkg" == "$spec" ]] && pkg=""
+  probe="${C_PROBE[$name]:-}"
+  case "$mgr" in
+    zsh)
+      [[ -e "$RC_LINK" ]] || return 1
+      [[ -z "$probe" ]] || pkg_present "$probe" || return 1
+      return 0
+      ;;
+    repo)
+      [[ -x "$LOCAL_BIN/${pkg:t}" ]]
+      ;;
+    *)
+      pkg_present "${probe:-$name}"
+      ;;
+  esac
+}
+
+# Where the thing actually lives, for the detail view. Answering "which one am I
+# getting" is most of the value of a `command -v`, and the shell entries have no
+# path to give — so they name their source file instead.
+tool_where() {
+  local name=$1 spec mgr pkg
+  spec="${C_MGR[$name]:-}"
+  mgr="${spec%%:*}"
+  pkg="${spec#*:}"
+  [[ "$pkg" == "$spec" ]] && pkg=""
+  case "$mgr" in
+    zsh) print -r -- "zsh/rc.zsh" ;;
+    repo) print -r -- "$LOCAL_BIN/${pkg:t} → $pkg" ;;
+    *) print -r -- "${commands[$name]:-${C_PROBE[$name]:-not on PATH}}" ;;
+  esac
+}
+
+# ── Rendering ────────────────────────────────────────────────────────────────
+
+# One row per tool: a hidden name field for lookups, then the display columns.
+# fzf is told to search only from column two, so the hidden name can't produce a
+# match the eye can't see.
+catalog_rows() {
+  local name glyph mgr
+  for name in "${C_NAMES[@]}"; do
+    if tool_installed "$name"; then
+      glyph="${GREEN}●${RESET}"
+    else
+      glyph="${YELLOW}○${RESET}"
+    fi
+    mgr="$(mgr_tag "${C_MGR[$name]%%:*}")"
+    printf '%s\t%s %-13s %s%-9s %-8s%s %s\n' \
+      "$name" "$glyph" "$name" "$DIM" "${C_CAT[$name]}" "$mgr" "$RESET" \
+      "${C_SUM[$name]}"
+  done
+}
+
+# Indent a block, leaving blank lines truly blank rather than two spaces wide.
+indent() {
+  local pad="${1:-  }" line
+  while IFS= read -r line; do
+    if [[ -z "$line" ]]; then
+      print -r --
+    else
+      print -r -- "$pad$line"
+    fi
+  done
+}
+
+render_examples() {
+  local name=$1 line cmd note
+  [[ -n "${C_EX[$name]:-}" ]] || return 0
+  print -r -- "  ${BOLD}Examples${RESET}"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    cmd="${line%%$JARVIS_RS*}"
+    note="${line#*$JARVIS_RS}"
+    [[ "$note" == "$line" ]] && note=""
+    print -r -- "    ${CYAN}${cmd}${RESET}"
+    [[ -z "$note" ]] || print -r -- "      ${DIM}${note}${RESET}"
+  done <<< "${C_EX[$name]}"
+}
+
+# The full page for one tool. Written to stdout so the caller decides whether it
+# goes through a pager, into fzf's preview pane, or down a pipe.
+render_tool() {
+  local name=$1 spec mgr pkg state
+  spec="${C_MGR[$name]}"
+  mgr="${spec%%:*}"
+  pkg="${spec#*:}"
+  [[ "$pkg" == "$spec" ]] && pkg=""
+
+  if tool_installed "$name"; then
+    state="${GREEN}● installed${RESET}"
+  else
+    state="${YELLOW}○ not installed${RESET}"
+  fi
+
+  print
+  print -r -- "  ${BOLD}${name}${RESET} — ${C_SUM[$name]}"
+  print
+  printf '  %-10s %s\n' "category" "${CAT_TITLE[${C_CAT[$name]}]:-${C_CAT[$name]}}"
+  printf '  %-10s %s\n' "status" "$state"
+  printf '  %-10s %s\n' "source" "$(mgr_label "$mgr")${pkg:+ ($pkg)}"
+  printf '  %-10s %s%s%s\n' "path" "$DIM" "$(tool_where "$name")" "$RESET"
+  [[ -z "${C_LINK[$name]}" ]] ||
+    printf '  %-10s %s%s%s\n' "docs" "$DIM" "${C_LINK[$name]}" "$RESET"
+  print
+
+  if [[ -n "${C_DETAIL[$name]}" ]]; then
+    print -r -- "${C_DETAIL[$name]}" | indent "  "
+    print
+  fi
+
+  render_examples "$name"
+
+  if [[ -n "${C_NOTE[$name]}" ]]; then
+    print
+    print -r -- "  ${DIM}Not in lib/packages.sh: ${C_NOTE[$name]}${RESET}"
+  fi
+
+  if [[ -n "${C_REL[$name]}" ]]; then
+    print
+    print -r -- "  ${BOLD}See also${RESET}  ${DIM}${C_REL[$name]// /, }${RESET}"
+  fi
+
+  # Only worth saying when it's actionable, and the answer differs by manager:
+  # a package has an install command, a symlink or an alias just needs apply.
+  if ! tool_installed "$name"; then
+    print
+    if mgr_installable "$mgr"; then
+      print -r -- "  ${YELLOW}Not installed.${RESET} ${DIM}jarvis install $name${RESET}"
+    else
+      print -r -- "  ${YELLOW}Not installed.${RESET} ${DIM}run 'apply' to link it${RESET}"
+    fi
+  fi
+  print
+}
+
+# Two pagers, because the two callers want opposite things from one.
+#
+# A one-shot `jarvis show rg` should behave like cat when the page is short:
+# -F quits immediately if it fits on one screen, -X leaves it there afterwards
+# instead of wiping it with the alternate buffer. Nothing repaints over it,
+# because the command is finished.
+#
+# Inside the browser's loop that same -F is a bug. less prints the page, exits
+# at once because it fits, and the next turn of the loop relaunches fzf — which
+# enters the alternate screen and paints over the page before you have read a
+# word of it. All you see is the list coming back with your query cleared, and
+# it only misbehaves on terminals tall enough to fit the page, which is what
+# makes it look like enter does nothing at all. There, less has to hold the
+# screen until you dismiss it.
+page() {
+  if [[ -t 1 ]] && (( $+commands[less] )); then
+    less -RFX
+  else
+    cat
+  fi
+}
+
+PAGE_HEADER='  esc · backspace · q  back    tab  run it    ↑↓ pgup pgdn  scroll'
+
+# The detail page is shown through fzf rather than less, and the reason is esc.
+#
+# less has no way to make a bare escape quit. Binding \e in a lesskey file gets
+# it exactly backwards, which is worth stating because it is not what you would
+# guess: ESC is the prefix of every arrow-key sequence, so a bare ESC leaves
+# less waiting for the rest of one and does nothing, while the DOWN ARROW —
+# which *is* \e[B — matches the binding and quits. Verified on less 668.
+#
+# fzf aborts on esc natively, scrolls with the arrows and page keys, and with
+# --no-input there is no query to type into, so backspace, q and tab are all
+# free to bind. The cursor-line colours are flattened to the terminal default
+# because this is a document, not a menu.
+show_page() {
+  local name=$1 self="${(q)SELF}"
+  if ! have fzf; then
+    render_tool "$name" | page
+    return 0
+  fi
+  render_tool "$name" | fzf \
+    --ansi \
+    --no-input \
+    --no-sort \
+    --layout=reverse \
+    --info=hidden \
+    --pointer='' \
+    --no-scrollbar \
+    --color='fg+:-1,bg+:-1,hl+:-1,gutter:-1' \
+    --bind='esc:abort' \
+    --bind='bspace:abort' \
+    --bind='ctrl-h:abort' \
+    --bind='q:abort' \
+    --bind='enter:abort' \
+    --bind="tab:execute:$self --run $name" \
+    --header="$PAGE_HEADER" >/dev/null
+  # abort is the normal way out of this, and it exits 130.
+  return 0
+}
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+cmd_list() {
+  local want="${1:-}" key name found=0
+  if [[ -n "$want" ]] && [[ -z "${CAT_TITLE[$want]:-}" ]]; then
+    die "no such category: $want (try: ${(j:, :)CAT_KEYS})"
+  fi
+  for key in "${CAT_KEYS[@]}"; do
+    [[ -z "$want" || "$key" == "$want" ]] || continue
+    print
+    print -r -- "${BOLD}${CAT_TITLE[$key]}${RESET}${DIM}  ${CAT_BLURB[$key]}${RESET}"
+    for name in "${C_NAMES[@]}"; do
+      [[ "${C_CAT[$name]}" == "$key" ]] || continue
+      found=1
+      if tool_installed "$name"; then
+        printf '  %s●%s %-13s %s%s%s\n' \
+          "$GREEN" "$RESET" "$name" "$DIM" "${C_SUM[$name]}" "$RESET"
+      else
+        printf '  %s○%s %-13s %s%s%s\n' \
+          "$YELLOW" "$RESET" "$name" "$DIM" "${C_SUM[$name]}" "$RESET"
+      fi
+    done
+  done
+  print
+  ((found)) || warn "nothing to show"
+}
+
+cmd_show() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: jarvis show <tool>"
+  if [[ -z "${C_MGR[$name]:-}" ]]; then
+    # A near miss is far more likely than a genuinely unknown tool, so spend the
+    # error message on the candidates rather than on the failure.
+    local -a near
+    near=("${(@M)C_NAMES:#*${name}*}")
+    if ((${#near})); then
+      warn "no tool called '$name'. Did you mean: ${(j:, :)near}?"
+    else
+      warn "no tool called '$name'. Try: jarvis search $name"
+    fi
+    return 1
+  fi
+  render_tool "$name"
+}
+
+cmd_search() {
+  local q="${1:-}" name hit=0
+  [[ -n "$q" ]] || die "usage: jarvis search <query>"
+  print
+  for name in "${C_NAMES[@]}"; do
+    if [[ "$name" == *"$q"* ]] ||
+      [[ "${(L)C_SUM[$name]}" == *"${(L)q}"* ]] ||
+      [[ "${(L)C_DETAIL[$name]}" == *"${(L)q}"* ]]; then
+      hit=1
+      printf '  %-13s %s%-9s%s %s\n' \
+        "$name" "$DIM" "${C_CAT[$name]}" "$RESET" "${C_SUM[$name]}"
+    fi
+  done
+  ((hit)) || warn "nothing matched '$q'"
+  print
+}
+
+cmd_status() {
+  packages_load
+  local name mgr key avail pkg_missing=0
+  local -a missing
+  local -A total present
+
+  for name in "${C_NAMES[@]}"; do
+    mgr="${C_MGR[$name]%%:*}"
+    total[$mgr]=$((${total[$mgr]:-0} + 1))
+    present[$mgr]=$((${present[$mgr]:-0}))
+    if tool_installed "$name"; then
+      present[$mgr]=$((present[$mgr] + 1))
+    else
+      missing+=("$name")
+      case "$mgr" in brew | cask | uv | cargo) pkg_missing=$((pkg_missing + 1)) ;; esac
+    fi
+  done
+
+  print
+  printf '  %-16s %-9s %s\n' "SOURCE" "PRESENT" "USABLE HERE"
+  # Walked in lib/managers.sh's order rather than the order tools happen to
+  # appear in the catalog, so the table reads the same on every machine.
+  for key in "${SETUP_MANAGERS[@]}"; do
+    [[ -n "${total[$key]:-}" ]] || continue
+    if mgr_available "$key"; then
+      avail="${GREEN}yes${RESET}"
+    else
+      avail="${RED}no${RESET}"
+    fi
+    printf '  %-16s %-9s %s\n' \
+      "$(mgr_label "$key")" "${present[$key]}/${total[$key]}" "$avail"
+  done
+  print
+
+  if ((${#missing} == 0)); then
+    ok "all ${#C_NAMES} tools in the catalog are present"
+  else
+    warn "${#missing} not installed:"
+    for name in "${missing[@]}"; do
+      printf '      %-13s %s%s%s\n' \
+        "$name" "$DIM" "$(mgr_label "${C_MGR[$name]%%:*}")" "$RESET"
+    done
+    print
+    print -r -- "  ${DIM}jarvis install${RESET}   install what a package manager can fix"
+    print -r -- "  ${DIM}apply${RESET}            link the scripts and shell config"
+  fi
+
+  # The two lists count different things — this one includes scripts and
+  # aliases, lib/packages.sh doesn't — so they only have to agree on the
+  # packages. When even those disagree, the registry and the catalog have
+  # drifted and doctor is where that gets diagnosed.
+  if ((pkg_missing != SETUP_MISSING_COUNT)); then
+    print
+    print -r -- "  ${DIM}lib/packages.sh counts $SETUP_MISSING_COUNT missing package(s), this counts $pkg_missing — run 'jarvis doctor'${RESET}"
+  fi
+  print
+}
+
+# `jarvis install a, b` and `jarvis install a,b` are both what someone would
+# type, and neither is what the shell hands over: the first arrives as "a," and
+# the second as one argument. Commas are punctuation here and never part of a
+# tool or manager name, so the argument list is flattened on them before
+# anything is looked up — otherwise the error message is about a tool called
+# "yq," and reads like a bug in the catalog.
+typeset -ga ARG_NAMES
+
+split_names() {
+  ARG_NAMES=()
+  local arg part
+  for arg in "$@"; do
+    for part in "${(@s:,:)arg}"; do
+      part="${part//[[:space:]]/}"
+      [[ -n "$part" ]] && ARG_NAMES+=("$part")
+    done
+  done
+}
+
+# `jarvis --run <tool>` — what tab does, in both the list and the detail page.
+#
+# It hands you a real interactive shell with the command already typed at the
+# prompt. It does not run anything itself, and that is deliberate on two counts.
+#
+# Nothing executes until you press enter, so the examples that carry a sudo or
+# a recursive delete are safe to land on by accident — you get to read the line
+# and edit it first, which is the same protection a confirmation would give and
+# a good deal more useful.
+#
+# And a third of this catalog is aliases and functions that exist only inside an
+# interactive shell. Run `ls` from a script's subshell and you get /bin/ls, not
+# the eza alias; `rgv` isn't a command at all. A real interactive zsh has your
+# prompt, your history, your aliases and your functions, so what runs is what
+# would have run had you typed it yourself.
+#
+# The prefill is print -z, which pushes onto zsh's editor buffer stack. The only
+# way to reach that in a shell you're launching is to own its startup file —
+# hence the throwaway ZDOTDIR, which restores the real one before sourcing
+# ~/.zshrc so nothing nested sees it.
+cmd_run() {
+  local name="${1:-}"
+  [[ -n "${C_MGR[$name]:-}" ]] || return 0
+
+  local -a cmds
+  local line
+  if [[ -n "${C_EX[$name]}" ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      cmds+=("${line%%$JARVIS_RS*}")
+    done <<< "${C_EX[$name]}"
+  fi
+
+  # The examples are the commands worth running; the bare tool name mostly just
+  # prints usage. With more than one, pick first.
+  local cmd=""
+  if ((${#cmds} == 0)); then
+    cmd="$name"
+  elif ((${#cmds} == 1)); then
+    cmd="${cmds[1]}"
+  else
+    cmd="$(print -rl -- "${cmds[@]}" | fzf \
+      --layout=reverse --height='~60%' --prompt='run❯ ' --pointer='▸' \
+      --header="  $name — pick a command to put on the prompt · esc cancels")" ||
+      return 0
+  fi
+  [[ -n "$cmd" ]] || return 0
+
+  local dir
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/jarvis-shell.XXXXXX")" || return 1
+  print -r -- '# Written by jarvis, and thrown away when you exit. Hand the session
+# straight back to the user'\''s own config, then put the command this shell
+# was launched for onto the command line -- unrun.
+[[ -n "$JARVIS_ZDOTDIR" ]] && ZDOTDIR="$JARVIS_ZDOTDIR" || unset ZDOTDIR
+[[ -f "$HOME/.zshrc" ]] && source "$HOME/.zshrc"
+print -z -- "$JARVIS_PREFILL"' >"$dir/.zshrc"
+
+  print
+  print -r -- "  ${DIM}enter runs it, or edit it first.  'exit' comes back to jarvis.${RESET}"
+  JARVIS_ZDOTDIR="${ZDOTDIR:-}" JARVIS_PREFILL="$cmd" ZDOTDIR="$dir" zsh -i
+  command rm -rf "$dir"
+}
+
+# The tap a formula needs, if any. Read out of lib/packages.sh rather than
+# duplicated in the catalog: the registry is what `brew tap` lines belong to,
+# and one source means nothing to keep in sync.
+tap_for() {
+  local formula=$1 entry
+  packages_load
+  for entry in ${SETUP_DECLARED_TAPS[@]+"${SETUP_DECLARED_TAPS[@]}"}; do
+    [[ "${entry%% *}" == "$formula" ]] || continue
+    print -r -- "${entry#* }"
+    return 0
+  done
+  return 1
+}
+
+confirm() {
+  if (( $+commands[gum] )); then
+    gum confirm "$1"
+  else
+    local reply
+    read -q "reply?  $1 [y/N] "
+    print
+    [[ "$reply" == [yY] ]]
+  fi
+}
+
+install_one() {
+  local name=$1 spec mgr pkg tap
+  spec="${C_MGR[$name]}"
+  mgr="${spec%%:*}"
+  pkg="${spec#*:}"
+  [[ "$pkg" == "$spec" ]] && pkg=""
+
+  if tool_installed "$name"; then
+    skip "$name already installed"
+    return 0
+  fi
+  if ! mgr_installable "$mgr"; then
+    warn "$name comes from $(mgr_label "$mgr"); run 'apply' to link it"
+    return 1
+  fi
+  if ! mgr_available "$mgr"; then
+    warn "$(mgr_label "$mgr") isn't installed, so $name can't be; run ./setup.sh"
+    return 1
+  fi
+
+  if [[ "$mgr" == brew ]] && tap="$(tap_for "$pkg")"; then
+    # Word-splitting is deliberate: the record is "tap [url]", and brew takes
+    # them as two arguments.
+    if brew tap ${=tap} >/dev/null 2>&1; then
+      ok "tapped ${tap%% *}"
+    else
+      warn "could not tap ${tap%% *}"
+    fi
+  fi
+
+  step "$name"
+  if mgr_install "$mgr" "${pkg:-$name}"; then
+    ok "$name installed"
+  else
+    warn "$name failed"
+    return 1
+  fi
+}
+
+# An undeclared tool is the interesting case. Installing it here would work and
+# would also be a trap: the machine gets it, no other machine does, and nothing
+# says so. The fix is one line in lib/packages.sh, so print that line — then
+# offer the one-off anyway, because being told the right way to do it is not the
+# same as being blocked.
+install_undeclared() {
+  local name=$1
+  print
+  warn "$name isn't in the catalog"
+  print
+  print -r -- "  Tools belong in ${BOLD}lib/packages.sh${RESET}, so every machine gets them:"
+  print
+  print -r -- "      ${CYAN}brew_formula $name${RESET}${DIM}        # what it's for${RESET}"
+  print -r -- "      ${DIM}uv_tool      $name${RESET}"
+  print -r -- "      ${DIM}cargo_crate  $name  <binary-name>${RESET}"
+  print
+  print -r -- "  ${DIM}...then 'apply', and document it in lib/catalog.sh.${RESET}"
+  print
+  if ! have brew; then
+    return 1
+  fi
+  # Nothing to confirm with when there's no terminal — a scripted or piped run
+  # gets the advice and stops there rather than blocking on a prompt.
+  [[ -t 0 ]] || return 1
+  confirm "Install $name with Homebrew on this machine only?" || {
+    skip "nothing installed"
+    return 1
+  }
+  brew install "$name"
+}
+
+cmd_install() {
+  packages_load
+  if (($# == 0)); then
+    # Everything declared but missing, which is exactly apply's package step —
+    # so call apply's code rather than a second copy of it. reconcile.sh is
+    # sourced lazily because it's the only part of the repo jarvis needs a
+    # subprocess-friendly context for, and most jarvis runs never touch it.
+    # shellcheck source=lib/reconcile.sh
+    source "$SETUP_REPO_DIR/lib/reconcile.sh"
+    install_missing_packages
+    return $?
+  fi
+  split_names "$@"
+  if ((${#ARG_NAMES} == 0)); then
+    warn "no tool names in: $*"
+    return 2
+  fi
+  local name rc=0
+  for name in "${ARG_NAMES[@]}"; do
+    if [[ -n "${C_MGR[$name]:-}" ]]; then
+      install_one "$name" || rc=1
+    else
+      install_undeclared "$name" || rc=1
+    fi
+  done
+  return $rc
+}
+
+cmd_upgrade() {
+  split_names "$@"
+  local m
+  for m in ${ARG_NAMES[@]+"${ARG_NAMES[@]}"}; do
+    [[ " ${SETUP_MANAGERS[*]} " == *" $m "* ]] ||
+      die "unknown manager: $m (known: ${SETUP_MANAGERS[*]})"
+  done
+  mgr_upgrade_all ${ARG_NAMES[@]+"${ARG_NAMES[@]}"}
+  print
+  ok "done"
+}
+
+# ── doctor ───────────────────────────────────────────────────────────────────
+# Three lists have to agree: what lib/packages.sh declares, what lib/catalog.sh
+# documents, and what's actually on the machine. Nothing keeps them in step by
+# construction, so this is what notices when they drift — in both directions,
+# because a package installed by hand and never declared is the failure that
+# only shows up months later on a different machine.
+
+DOCTOR_ISSUES=0
+
+doctor_note() {
+  DOCTOR_ISSUES=$((DOCTOR_ISSUES + 1))
+  warn "$1"
+}
+
+# The catalog entry whose manager spec is exactly this one, if there is any.
+catalog_entry_for_spec() {
+  local spec=$1 name
+  for name in "${C_NAMES[@]}"; do
+    if [[ "${C_MGR[$name]}" == "$spec" ]]; then
+      print -r -- "$name"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# True when the catalog documents this exact manager:package AND carries a note
+# saying why it isn't in the registry — juliaup, for one, which reconcile.sh
+# installs by hand. Without this, the honest exceptions would be reported as
+# drift on every run and the report would stop being worth reading.
+spec_noted() {
+  local name
+  name="$(catalog_entry_for_spec "$1")" || return 1
+  [[ -n "${C_NOTE[$name]}" ]]
+}
+
+doctor_registry_vs_catalog() {
+  step "Registry ↔ catalog"
+  local spec name mgr pkg clean=1
+
+  for spec in ${SETUP_DECLARED[@]+"${SETUP_DECLARED[@]}"}; do
+    if ! catalog_entry_for_spec "$spec" >/dev/null; then
+      doctor_note "lib/packages.sh declares $spec, but lib/catalog.sh doesn't document it"
+      clean=0
+    fi
+  done
+
+  for name in "${C_NAMES[@]}"; do
+    mgr="${C_MGR[$name]%%:*}"
+    pkg="${C_MGR[$name]#*:}"
+    [[ "$pkg" == "${C_MGR[$name]}" ]] && pkg=""
+    # Only the four managers the registry actually speaks for. rustup, juliaup,
+    # repo, zsh and system all install by other means, and a tool with no
+    # package name is the manager itself.
+    case "$mgr" in brew | cask | uv | cargo) ;; *) continue ;; esac
+    [[ -n "$pkg" ]] || continue
+    [[ -n "${C_NOTE[$name]}" ]] && continue
+    if [[ " ${SETUP_DECLARED[*]} " != *" $mgr:$pkg "* ]]; then
+      doctor_note "lib/catalog.sh documents $name as $mgr:$pkg, but lib/packages.sh doesn't declare it — other machines won't get it"
+      clean=0
+    fi
+  done
+
+  ((clean)) && ok "every declared package is documented, and vice versa"
+}
+
+# Compare what a manager reports installed against what the registry declares.
+# The interesting direction: something you installed by hand once, that no other
+# machine will ever get because nothing wrote it down.
+doctor_undeclared() {
+  step "Installed here but not declared"
+  local clean=1 pkg
+
+  if have brew; then
+    while IFS= read -r pkg; do
+      [[ -n "$pkg" ]] || continue
+      # brew reports taps as user/tap/formula; the registry declares the leaf.
+      pkg="${pkg##*/}"
+      [[ " ${SETUP_DECLARED[*]} " == *" brew:$pkg "* ]] && continue
+      spec_noted "brew:$pkg" && continue
+      doctor_note "brew formula '$pkg' — add 'brew_formula $pkg' to lib/packages.sh"
+      clean=0
+    done < <(brew leaves --installed-on-request 2>/dev/null)
+  fi
+
+  if have uv; then
+    # `uv tool list` indents each tool's shims under the package line, so the
+    # unindented lines are the packages and the first word is the name.
+    while IFS= read -r pkg; do
+      [[ "$pkg" == [a-zA-Z0-9]* ]] || continue
+      pkg="${pkg%% *}"
+      [[ " ${SETUP_DECLARED[*]} " == *" uv:$pkg "* ]] && continue
+      spec_noted "uv:$pkg" && continue
+      doctor_note "uv tool '$pkg' — add 'uv_tool $pkg' to lib/packages.sh"
+      clean=0
+    done < <(uv tool list 2>/dev/null)
+  fi
+
+  if have cargo; then
+    # `cargo install --list` prints "crate v1.2.3:" then its binaries indented.
+    while IFS= read -r pkg; do
+      [[ "$pkg" == [a-zA-Z0-9]*:* ]] || continue
+      pkg="${pkg%% *}"
+      [[ " ${SETUP_DECLARED[*]} " == *" cargo:$pkg "* ]] && continue
+      spec_noted "cargo:$pkg" && continue
+      doctor_note "cargo crate '$pkg' — add 'cargo_crate $pkg <binary>' to lib/packages.sh"
+      clean=0
+    done < <(cargo install --list 2>/dev/null)
+  fi
+
+  ((clean)) && ok "nothing installed that isn't declared"
+}
+
+doctor_repo_scripts() {
+  step "Scripts in bin/"
+  local src base clean=1
+  for src in "$SETUP_REPO_DIR"/bin/*(N); do
+    [[ -f "$src" ]] || continue
+    base="${src:t}"
+    if [[ -z "${C_MGR[$base]:-}" ]]; then
+      doctor_note "bin/$base has no entry in lib/catalog.sh"
+      clean=0
+    elif [[ ! -x "$LOCAL_BIN/$base" ]]; then
+      doctor_note "bin/$base isn't linked into $LOCAL_BIN — run 'apply'"
+      clean=0
+    fi
+  done
+  # And the reverse: a catalog entry pointing at a file that isn't there.
+  local name pkg
+  for name in "${C_NAMES[@]}"; do
+    [[ "${C_MGR[$name]%%:*}" == repo ]] || continue
+    pkg="${C_MGR[$name]#*:}"
+    if [[ ! -f "$SETUP_REPO_DIR/$pkg" ]]; then
+      doctor_note "lib/catalog.sh points $name at $pkg, which doesn't exist"
+      clean=0
+    fi
+  done
+  ((clean)) && ok "every script in bin/ is documented and linked"
+}
+
+doctor_catalog_lint() {
+  step "Catalog"
+  local name clean=1
+  for name in "${C_NAMES[@]}"; do
+    [[ -n "${C_SUM[$name]}" ]] || {
+      doctor_note "$name has no summary"
+      clean=0
+    }
+    [[ -n "${CAT_TITLE[${C_CAT[$name]}]:-}" ]] || {
+      doctor_note "$name is in category '${C_CAT[$name]}', which isn't declared"
+      clean=0
+    }
+    [[ " ${SETUP_MANAGERS[*]} " == *" ${C_MGR[$name]%%:*} "* ]] || {
+      doctor_note "$name names an unknown manager '${C_MGR[$name]%%:*}'"
+      clean=0
+    }
+  done
+  ((clean)) && ok "${#C_NAMES} entries, all well-formed"
+}
+
+doctor_shell() {
+  step "Shell config"
+  if [[ -L "$RC_LINK" ]]; then
+    local target="${RC_LINK:A}"
+    if [[ "$target" == "$SETUP_REPO_DIR/zsh/rc.zsh" ]]; then
+      ok "rc.zsh linked to this checkout"
+    else
+      doctor_note "$RC_LINK points at $target, not this checkout"
+    fi
+  else
+    doctor_note "$RC_LINK isn't a symlink — the aliases and functions above won't exist"
+  fi
+}
+
+# The browser's search is a property of how three fzf flags interact, not of
+# anything in this repo's own data — so it can break without a single line here
+# changing, and it breaks silently: the list still renders, typing just stops
+# matching. One --filter run against the real argument list catches that.
+doctor_browser() {
+  step "Browser"
+  if ! have fzf; then
+    skip "fzf isn't installed; jarvis falls back to the plain list"
+    return 0
+  fi
+  fzf_browse_args
+  local probe="${C_NAMES[1]}" top
+  top="$(catalog_rows | fzf "${FZF_BROWSE_ARGS[@]}" --filter="$probe" 2>/dev/null | head -1)"
+  if [[ -z "$top" ]]; then
+    doctor_note "typing '$probe' in the browser matches nothing — check fzf_browse_args"
+    return 0
+  elif [[ "${top%%$'\t'*}" != "$probe" ]]; then
+    doctor_note "the browser's top hit for '$probe' resolves to '${top%%$'\t'*}'"
+    return 0
+  fi
+
+  # The loop reads fzf's output as "query on line one, selected row on line
+  # two". That shape comes from --print-query and is easy to break by moving a
+  # flag, so assert it rather than trusting it — getting it wrong would silently
+  # feed the query into the tool lookup.
+  local -a shape
+  shape=("${(@f)$(catalog_rows | fzf "${FZF_BROWSE_ARGS[@]}" --print-query --filter="$probe" 2>/dev/null)}")
+  if ((${#shape} < 2)) || [[ "${shape[1]}" != "$probe" || "${shape[2]%%$'\t'*}" != "$probe" ]]; then
+    doctor_note "--print-query output isn't 'query, then row' — cmd_tui parses that shape"
+    return 0
+  fi
+
+  ok "search matches, and a selection resolves back to a tool"
+}
+
+cmd_doctor() {
+  packages_load
+  doctor_catalog_lint
+  doctor_registry_vs_catalog
+  doctor_repo_scripts
+  doctor_undeclared
+  doctor_shell
+  doctor_browser
+  step "Result"
+  if ((DOCTOR_ISSUES == 0)); then
+    ok "no drift: the registry, the catalog and this machine agree"
+  else
+    warn "$DOCTOR_ISSUES thing(s) to look at above"
+  fi
+  print
+  ((DOCTOR_ISSUES == 0))
+}
+
+# ── The browser ──────────────────────────────────────────────────────────────
+
+FZF_HEADER='  enter docs · tab run it · ctrl-y copy · ctrl-o homepage · ctrl-r refresh · esc quit'
+
+offer_install() {
+  local name=$1 mgr="${C_MGR[$1]%%:*}"
+  [[ -t 0 ]] || return 0
+  if ! mgr_installable "$mgr"; then
+    return 0
+  fi
+  confirm "$name isn't installed. Install it now?" || return 0
+  install_one "$name"
+  print
+  print -n -- "  press enter to go back "
+  read -r _
+}
+
+# Built once and shared with doctor's regression check below, so the thing that
+# gets verified is the same argument list the browser actually runs.
+typeset -ga FZF_BROWSE_ARGS
+
+fzf_browse_args() {
+  local self="${(q)SELF}"
+  FZF_BROWSE_ARGS=(
+    --ansi
+    --delimiter=$'\t'
+    # Rows are "name<TAB>display", and this hides the name field from the
+    # display — and, just as importantly, from matching, so the hidden column
+    # can't produce a hit the eye can't see. fzf still hands back the whole
+    # original line on accept, which is where the name is read from.
+    #
+    # Do NOT add --nth on top of this. --nth scopes the search within the
+    # string --with-nth has already produced, and that string has no tabs left
+    # in it — so --nth=2.. asks for a field that doesn't exist and silently
+    # matches nothing at all, however much is on screen.
+    --with-nth=2..
+    --layout=reverse
+    --info=inline
+    --prompt='jarvis❯ '
+    --pointer='▸'
+    --preview="$self --preview {1}"
+    --preview-window='right,58%,border-left,wrap'
+    --preview-window='<110(down,65%,border-top,wrap)'
+    --bind="focus:change-header:$FZF_HEADER"
+    --bind="ctrl-r:reload:$self --rows"
+    --bind="ctrl-y:execute-silent:$self --copy {1}"
+    --bind="ctrl-y:+change-header:  copied to the clipboard"
+    --bind="ctrl-o:execute-silent:$self --open {1}"
+    --bind="tab:execute:$self --run {1}"
+    --bind='ctrl-/:toggle-preview'
+    --header="$FZF_HEADER"
+  )
+}
+
+cmd_tui() {
+  if ! have fzf; then
+    warn "fzf isn't installed, so here's the plain list"
+    cmd_list
+    return 0
+  fi
+  local pick name query="" raw rc
+  local -a out
+  fzf_browse_args
+  while true; do
+    # --print-query is added here rather than in the shared list because it
+    # changes the shape of fzf's output, and doctor's check reads that output
+    # too. --query seeds the next pass with whatever was typed on the last one:
+    # each turn of this loop is a brand new fzf process, so without it,
+    # returning from a tool's page drops you back at the top of all fifty
+    # instead of into the search you were already looking at.
+    raw="$(catalog_rows | fzf "${FZF_BROWSE_ARGS[@]}" --print-query --query="$query")"
+    rc=$?
+    out=("${(@f)raw}")
+    query="${out[1]:-}"
+    case $rc in
+      0) ;;            # something was selected
+      1) continue ;;   # enter with nothing matching: keep the query, redraw
+      *) break ;;      # esc, ctrl-c, or fzf couldn't run
+    esac
+    pick="${out[2]:-}"
+    [[ -n "$pick" ]] || break
+    name="${pick%%$'\t'*}"
+    show_page "$name"
+    tool_installed "$name" || offer_install "$name"
+  done
+}
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<USAGE
+
+  ${BOLD}jarvis${RESET} — every tool this repo puts on the machine, in one place
+
+    jarvis                    browse: type to filter, enter for the full page
+    jarvis list [category]    the same list as plain text
+    jarvis show <tool>        one tool in full
+    jarvis search <query>     match on name, summary or description
+    jarvis status             what's installed and what isn't, per source
+    jarvis install            install everything declared but missing
+    jarvis install <tool>     install one tool, whichever manager owns it
+    jarvis upgrade [mgr...]   upgrade every manager on the machine, or just some
+    jarvis doctor             check the registry, the catalog and the machine agree
+    jarvis categories         list the categories
+
+  Categories: ${(j:, :)CAT_KEYS}
+  Managers:   ${SETUP_MANAGERS[*]}
+
+  Adding a tool is two lines: one in lib/packages.sh so every machine installs
+  it, one in lib/catalog.sh so it turns up here with its docs. 'jarvis doctor'
+  tells you when you've done one and forgotten the other.
+
+USAGE
+}
+
+cmd_categories() {
+  local key
+  print
+  for key in "${CAT_KEYS[@]}"; do
+    printf '  %-10s %s%s%s\n' \
+      "$key" "$DIM" "${CAT_TITLE[$key]} — ${CAT_BLURB[$key]}" "$RESET"
+  done
+  print
+}
+
+main() {
+  catalog_load
+  packages_load
+
+  local sub="${1:-}"
+  (($#)) && shift
+
+  case "$sub" in
+    # Internal, used by the fzf bindings above. Kept undocumented in usage
+    # because they're an implementation detail of the browser, not commands.
+    --preview)
+      [[ -n "${C_MGR[${1:-}]:-}" ]] || return 0
+      render_tool "$1"
+      ;;
+    --rows) catalog_rows ;;
+    --run) cmd_run "${1:-}" ;;
+    --copy)
+      local first="${C_EX[${1:-}]%%$'\n'*}"
+      first="${first%%$JARVIS_RS*}"
+      [[ -n "$first" ]] || first="$1"
+      print -rn -- "$first" | pbcopy
+      ;;
+    --open)
+      # A tool with no homepage is the common case, not an error — ctrl-o on one
+      # should do nothing rather than flash a failure into the preview pane.
+      if [[ -n "${C_LINK[${1:-}]:-}" ]]; then
+        open "${C_LINK[$1]}"
+      fi
+      ;;
+    "")
+      # A pipe or a redirect wants text, not a full-screen picker.
+      if [[ -t 1 ]]; then cmd_tui; else cmd_list; fi
+      ;;
+    list | ls) cmd_list "$@" ;;
+    show | info) cmd_show "$@" | page ;;
+    search | find) cmd_search "$@" ;;
+    status | st) cmd_status ;;
+    install | add) cmd_install "$@" ;;
+    upgrade | update | up) cmd_upgrade "$@" ;;
+    doctor | check) cmd_doctor ;;
+    categories | cats) cmd_categories ;;
+    -h | --help | help) usage ;;
+    *)
+      # `jarvis rg` is what you'd type before you'd type `jarvis show rg`, so
+      # treat a bare name as a lookup rather than an error.
+      if [[ -n "${C_MGR[$sub]:-}" ]]; then
+        cmd_show "$sub" | page
+      else
+        warn "unknown command: $sub"
+        usage
+        return 2
+      fi
+      ;;
+  esac
+}
+
+main "$@"

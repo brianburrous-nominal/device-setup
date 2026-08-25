@@ -213,12 +213,14 @@ rgv() {
 
   source "$repo/lib/packages.sh"
   (( SETUP_MISSING_COUNT == 0 )) || print -P \
-    "%F{cyan}*%f ${SETUP_MISSING_COUNT} declared package(s) not installed — run %Bapply%b"
+    "%F{cyan}*%f ${SETUP_MISSING_COUNT} declared package(s) not installed — run %Bapply%b (or %Bjarvis status%b to see which)"
 
   # Sourced files leak their names into the interactive shell; don't make the
   # user tab-complete a DSL they'll never call by hand.
-  unfunction pkg_present brew_formula brew_cask uv_tool cargo_crate 2>/dev/null
+  unfunction pkg_present brew_formula brew_cask uv_tool cargo_crate declared \
+    2>/dev/null
   unset SETUP_PACKAGES_SOURCED SETUP_BREW_PREFIX SETUP_DECLARED_COUNT \
     SETUP_MISSING_COUNT MISSING_BREW_FORMULAE MISSING_BREW_CASKS \
-    MISSING_UV_TOOLS MISSING_CARGO_CRATES MISSING_BREW_TAPS
+    MISSING_UV_TOOLS MISSING_CARGO_CRATES MISSING_BREW_TAPS \
+    SETUP_DECLARED SETUP_DECLARED_TAPS
 } "${${(%):-%N}:A:h:h}"

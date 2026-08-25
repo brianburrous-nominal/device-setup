@@ -8,6 +8,8 @@
 #               from then on
 #   zsh/rc.zsh  notices at shell startup that something declared here isn't
 #               installed, and says "run apply"
+#   bin/jarvis  shows install status per tool, and reconciles this list against
+#               the documentation in lib/catalog.sh
 #
 # Declaration is separated from installation. Sourcing this file only *probes*:
 # it never installs, never touches the network, and never forks a process.
@@ -31,6 +33,19 @@ MISSING_UV_TOOLS=()
 MISSING_CARGO_CRATES=()
 MISSING_BREW_TAPS=()
 SETUP_DECLARED_COUNT=0
+
+# The full declared list — every entry, not just the absent ones — as
+# `manager:package` records, plus the formula-to-tap mapping. Only built when
+# SETUP_RECORD_DECLARED is set, which `jarvis doctor` does and the interactive
+# shell never does: reconciling the registry against lib/catalog.sh needs to see
+# what's already installed, and shell startup only ever needs to count what
+# isn't. The guard is one [[ -n ]] test per declaration, so the fast path pays
+# nothing for a list it would immediately throw away.
+SETUP_DECLARED=()
+SETUP_DECLARED_TAPS=()
+declared() {
+  [[ -z "${SETUP_RECORD_DECLARED:-}" ]] || SETUP_DECLARED+=("$1")
+}
 
 # Homebrew's prefix without forking `brew --prefix`. .zprofile exports
 # HOMEBREW_PREFIX for login shells; the fallback covers everything else.
@@ -69,6 +84,9 @@ fi
 brew_formula() {
   local formula="$1" probe="${2:-$1}" tap="${3:-}" tap_url="${4:-}"
   SETUP_DECLARED_COUNT=$((SETUP_DECLARED_COUNT + 1))
+  declared "brew:$formula"
+  [[ -z "$tap" || -z "${SETUP_RECORD_DECLARED:-}" ]] ||
+    SETUP_DECLARED_TAPS+=("$formula $tap${tap_url:+ $tap_url}")
   if pkg_present "$probe"; then
     return 0
   fi
@@ -82,6 +100,7 @@ brew_formula() {
 brew_cask() {
   local cask="$1" probe="${2:-$SETUP_BREW_PREFIX/Caskroom/$1}"
   SETUP_DECLARED_COUNT=$((SETUP_DECLARED_COUNT + 1))
+  declared "cask:$cask"
   if pkg_present "$probe"; then
     return 0
   fi
@@ -92,6 +111,7 @@ brew_cask() {
 uv_tool() {
   local tool="$1" probe="${2:-$1}"
   SETUP_DECLARED_COUNT=$((SETUP_DECLARED_COUNT + 1))
+  declared "uv:$tool"
   if pkg_present "$probe"; then
     return 0
   fi
@@ -103,6 +123,7 @@ uv_tool() {
 cargo_crate() {
   local crate="$1" probe="$2"
   SETUP_DECLARED_COUNT=$((SETUP_DECLARED_COUNT + 1))
+  declared "cargo:$crate"
   if pkg_present "$probe"; then
     return 0
   fi
@@ -133,6 +154,10 @@ brew_formula wget              # mason falls back to it when curl is unavailable
 brew_formula ast-grep          # structural search/replace; grug-far.nvim's backend
 brew_formula sd                # find-and-replace with plain regex instead of sed's
 brew_formula scc               # line/complexity counts per language
+brew_formula just              # project-scoped command runner; reads a justfile
+# mikefarah's Go yq, not the Python wrapper of the same name. jq's syntax
+# applied to YAML, which is what CI configs and k8s manifests are written in.
+brew_formula yq
 brew_formula gum               # prompts/spinners/styling (bin/nomprofile needs it)
 brew_formula bat               # syntax-highlighted cat; rgv's preview pane uses it
 brew_formula shellcheck        # lints the scripts in this repo (and bin/*)
@@ -141,6 +166,12 @@ brew_formula shellcheck        # lints the scripts in this repo (and bin/*)
 # nmap's table is the reason to prefer it over arp-scan's, which is a years-old
 # snapshot missing Raspberry Pi and much of Ubiquiti.
 brew_formula nmap              # port scanner; also the MAC-vendor database
+# Layer-2 scanner. Not what bin/netscan uses -- netscan needs no scanner binary
+# and reads nmap's vendor table, not this one, whose bundled ieee-oui.txt is
+# years older. Declared for the times you want a real ARP sweep: it asks the
+# wire directly instead of inferring from an ICMP sweep, so it finds hosts that
+# drop pings, and it needs root.
+brew_formula arp-scan
 # Tobi Lütke's experiment-directory manager. Its tap lives in a repo that isn't
 # named homebrew-try, so the URL has to be spelled out for `brew tap`.
 brew_formula try try tobi/try https://github.com/tobi/try

@@ -9,7 +9,7 @@ On a machine with nothing on it, this is the whole command:
 curl -fsSL https://raw.githubusercontent.com/brianburrous-nominal/device-setup/main/bootstrap.sh | bash
 ```
 
-From then on it's `apply`, from anywhere.
+From then on it's `apply`, from anywhere — and `jarvis` to see what you have.
 
 Three pieces, with a clear division of labour:
 
@@ -36,28 +36,138 @@ shell config is added only once.
 |---|---|
 | Package managers | Homebrew, uv, rustup (cargo), pnpm, juliaup |
 | Shell | Oh My Zsh, atuin, zoxide, direnv, fzf |
-| CLI | ripgrep, fd, jq, eza, bat, sd, scc, gh, git, lazygit, wget, ast-grep, gum |
+| CLI | ripgrep, fd, jq, yq, eza, bat, sd, scc, gh, git, lazygit, wget, ast-grep, gum, shellcheck |
 | Python | ruff, JupyterLab, httpie — installed with `uv tool install` (isolated venv, shim in `~/.local/bin`) |
 | Julia | current stable release, via `juliaup add release` |
 | Editor | Neovim + LazyVim, node (for mason's npm-based LSP servers) |
+| Network | nmap, arp-scan — plus `netscan` and `netif` in `bin/`, which need neither |
 | Nominal | `nomctl` (the `nominal-cli` crate, via `cargo install`) |
-| Other | `try` for scratch directories, JetBrainsMono Nerd Font |
+| Other | `just` for project commands, `try` for scratch directories, JetBrainsMono Nerd Font |
 
 Nothing is needed for `trash` — macOS 15 added `/usr/bin/trash`, which is why
 Homebrew's `trash` and `macos-trash` formulae are both keg-only now.
 
+This table is the summary; `jarvis` is the version that can't go stale, since it
+reads the same declarations the installer does.
+
 It also links the shell config and the scripts in `bin/` into place — see
 [Shell config](#shell-config) below.
 
+## jarvis
+
+`jarvis` is the front door to all of it. Every tool this repo puts on the
+machine in one browsable list, with what it's for and what to type:
+
+```
+jarvis                    browse: type to filter, enter for the full page
+jarvis show rg            one tool in full — docs, examples, where it came from
+jarvis list search        one category, as plain text
+jarvis search json        match on name, summary or description
+jarvis status             what's installed and what isn't, per source
+jarvis install            install everything declared but missing
+jarvis install ripgrep    install one tool, whichever manager owns it
+jarvis upgrade            upgrade every manager on the machine
+jarvis upgrade brew uv    ...or just some of them
+jarvis doctor             check the registry, the catalog and the machine agree
+```
+
+In the browser: type to filter, `enter` for the full page, `esc` to quit.
+`ctrl-y` copies the first example, `ctrl-o` opens the homepage, `ctrl-r`
+re-probes what's installed. On the full page, `esc`, `backspace` and `q` all go
+back.
+
+`tab` is the one worth knowing. It takes one of the tool's examples and puts it
+on a real shell prompt, ready to edit and run:
+
+```
+➜  setup git:(main) netscan --json | jq .
+```
+
+Nothing runs until you press enter, which is what makes it safe to land on an
+example that carries a `sudo` or a recursive delete — you read the line first.
+And it's an interactive shell with your own config loaded, so the aliases and
+functions in the catalog actually work: run `ls` from a script's subshell and
+you'd get `/bin/ls`, not the eza alias. `exit` comes back to the browser.
+
+The point is that you stop having to remember which manager owns what. A brew
+formula, a uv tool, a cargo crate, a script in `bin/` and an alias in
+`zsh/rc.zsh` all look the same in the list and answer to the same commands —
+which matters most for the ones that aren't packages at all. `ls` is an eza
+alias, `rm` is a function wrapping `trash`, `netscan` is a script in `bin/`.
+None of those can be declared in `lib/packages.sh`, because nothing installs
+them, but all of them are things you type.
+
+Run it with no terminal — piped, redirected — and you get the plain list
+instead of the picker, so `jarvis | grep …` does what you'd expect.
+
+### How each manager is reached
+
+One file knows, and everything else asks it:
+
+| | |
+|---|---|
+| `lib/managers.sh` | how each manager installs and upgrades. Bash- and zsh-safe, because both `lib/reconcile.sh` and `bin/jarvis` source it |
+
+That's why `apply -u` and `jarvis upgrade` can't drift: they are the same walk
+over the same list. Adding a manager is a case branch in that one file, and
+every caller picks it up.
+
+Two honest gaps it reports rather than papers over. `cargo install` has no
+upgrade command — it only ever installs the latest and refuses when that's what
+you already have — so crates go unchecked unless `cargo-update` is installed,
+and `jarvis upgrade cargo` says so instead of running `rustup update` and
+looking like it checked. And `brew upgrade` already covers casks, so the cask
+step is a stated no-op rather than a second pass over the same work.
+
+### `jarvis doctor`
+
+Three lists have to agree: what `lib/packages.sh` declares, what
+`lib/catalog.sh` documents, and what is actually on the machine. Nothing keeps
+them in step by construction, so `doctor` checks all three against each other:
+
+```
+$ jarvis doctor
+==> Registry ↔ catalog
+  ! lib/catalog.sh documents fd as brew:fd, but lib/packages.sh doesn't
+    declare it — other machines won't get it
+
+==> Installed here but not declared
+  ! brew formula 'yq' — add 'brew_formula yq' to lib/packages.sh
+```
+
+That second direction is the one worth having. A formula you installed by hand
+months ago works fine here and is simply absent everywhere else, and nothing
+else in the repo would ever mention it. It reads `brew leaves
+--installed-on-request`, `uv tool list` and `cargo install --list`, so it only
+sees what you asked for, not the dependency graph underneath.
+
+The handful of tools something other than the registry installs — `juliaup`,
+which `reconcile_julia` handles — carry a `-n` note in the catalog saying why,
+which is what stops the honest exceptions being reported as drift on every run.
+
 ## Adding a tool
 
-One line in `lib/packages.sh`:
+Two lines. One in `lib/packages.sh`, so every machine installs it:
 
 ```sh
 brew_formula hyperfine        # benchmarking
 uv_tool     pre-commit
 cargo_crate some-crate  itsbinary
 ```
+
+...and one in `lib/catalog.sh`, so it turns up in `jarvis` with its docs:
+
+```sh
+tool hyperfine dev brew:hyperfine \
+  -s "benchmark a command properly — warmup runs, statistics, outlier detection" \
+  -d "The longer explanation. Say why you'd reach for it over the obvious
+alternative, not just what it does." \
+  -x "hyperfine 'rg foo' 'grep -r foo .'"  "compare two commands" \
+  -l "https://github.com/sharkdp/hyperfine"
+```
+
+Do one and forget the other and `jarvis doctor` tells you, in whichever
+direction you missed.
 
 Commit it, and every other machine says so at its next shell prompt:
 
@@ -66,13 +176,14 @@ Commit it, and every other machine says so at its next shell prompt:
 ```
 
 That notice is the point of the layout. `lib/packages.sh` is the single list of
-what should be installed, and three different things read it:
+what should be installed, and four different things read it:
 
 | | |
 |---|---|
 | `setup.sh` | bootstraps a bare machine, then installs whatever is missing |
 | `bin/apply` | reconciles a machine that already exists |
 | `zsh/rc.zsh` | notices at startup that something isn't installed, and says so |
+| `bin/jarvis` | shows install status per tool, and reconciles the list against the docs |
 
 **Declaration is separated from installation.** Sourcing `lib/packages.sh` only
 *probes* — it never installs, never touches the network, and never forks a
@@ -88,6 +199,8 @@ absent on the desktop until someone remembers to re-run it.
 | File | Holds |
 |---|---|
 | `lib/packages.sh` | what should be installed. Declaration only; bash- and zsh-safe |
+| `lib/catalog.sh` | what every tool *is*, and what to type. Read only by `jarvis` |
+| `lib/managers.sh` | how each manager installs and upgrades. Bash- and zsh-safe |
 | `lib/reconcile.sh` | how to install it, plus the symlinks and the nvim overlay |
 | `lib/common.sh` | output helpers shared by `setup.sh` and `apply` |
 | `lib/identity.sh` | SSH key, GitHub auth, git identity. Interactive; not used by `apply` |
@@ -95,6 +208,14 @@ absent on the desktop until someone remembers to re-run it.
 
 A few tools aren't one-line declarations and live in `lib/reconcile.sh` instead:
 `juliaup`, because "installed" has two levels there — the tool, then a channel.
+
+`lib/catalog.sh` is separate from `lib/packages.sh` for the same reason the
+registry is separate from the installer. The registry is sourced on every shell
+startup and is allowed to know nothing but "should this be installed?"; the
+catalog is read only by `jarvis` and can be as long as the documentation needs
+to be. It is also a strict superset — a third of it isn't a package at all —
+so folding the two together would mean teaching the installer about tools it
+can't install.
 
 ### Probes
 
@@ -117,6 +238,9 @@ apply              # pull, then install anything declared but missing
 apply -u           # ...and upgrade what's already installed first
 apply --skip-pull  # leave git alone
 ```
+
+`apply -u` walks every manager in `lib/managers.sh` — the same walk `jarvis
+upgrade` does, and the same code.
 
 `apply` re-execs itself after the pull. Without that, a run that fetched a
 change to `apply`, `lib/packages.sh`, or `lib/reconcile.sh` would go on using
