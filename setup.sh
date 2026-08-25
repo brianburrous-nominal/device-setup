@@ -3,8 +3,8 @@
 # setup-mac.sh — bootstrap a macOS dev environment.
 #
 # Installs: Homebrew, Oh My Zsh, uv, Neovim + LazyVim, try, zoxide,
-#           ripgrep (rg), fd, jq, gum, bat, ruff, pnpm, JupyterLab,
-#           Julia via juliaup, nomctl, and Rust/cargo via rustup.
+#           ripgrep (rg), fd, jq, gum, bat, sd, scc, ruff, httpie, pnpm,
+#           JupyterLab, Julia via juliaup, nomctl, and Rust/cargo via rustup.
 #
 # Shell config lives in zsh/rc.zsh in this repo, symlinked into place. ~/.zshrc
 # only ever gets two source lines from us, so Oh My Zsh keeps owning that file
@@ -169,6 +169,8 @@ BREW_FORMULAE=(
   pnpm     # fast npm alternative (needs the node above)
   wget     # mason falls back to it when curl is unavailable
   ast-grep # structural search/replace backend for grug-far.nvim
+  sd       # find-and-replace with plain regex syntax instead of sed's
+  scc      # line/complexity counts per language
   gum      # prompts/spinners/styling for shell scripts (bin/nomprofile needs it)
   bat      # syntax-highlighted cat; rgv's preview pane uses it
 )
@@ -209,6 +211,7 @@ export PATH="$HOME/.local/bin:$PATH"
 UV_TOOLS=(
   ruff       # Python linter + formatter
   jupyterlab # notebooks; launches as `jupyter-lab`, see note below
+  httpie     # friendlier curl; provides http/https/httpie
 )
 for t in "${UV_TOOLS[@]}"; do
   if uv tool list 2>/dev/null | grep -q "^$t "; then
@@ -430,6 +433,9 @@ cat <<EOF
     gh        $(gh --version 2>/dev/null | head -1 | awk '{print $3}')
     gum       $(gum --version 2>/dev/null | awk '{print $3}')
     bat       $(bat --version 2>/dev/null | awk '{print $2}')
+    sd        $(sd --version 2>/dev/null | awk '{print $2}')
+    scc       $(scc --version 2>/dev/null | awk '{print $3}')
+    httpie    $(http --version 2>/dev/null)
     nomctl    $(nomctl --version 2>/dev/null | awk '{print $2}')
     julia     $(julia --version 2>/dev/null | awk '{print $3}')
     jupyter   $(jupyter-lab --version 2>/dev/null)

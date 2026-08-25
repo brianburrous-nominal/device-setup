@@ -18,8 +18,8 @@ added to a shell config is added only once.
 |---|---|
 | Package managers | Homebrew, uv, rustup (cargo), pnpm, juliaup |
 | Shell | Oh My Zsh, atuin, zoxide, direnv, fzf |
-| CLI | ripgrep, fd, jq, eza, bat, gh, git, lazygit, wget, ast-grep, gum |
-| Python | ruff, JupyterLab — installed with `uv tool install` (isolated venv, shim in `~/.local/bin`) |
+| CLI | ripgrep, fd, jq, eza, bat, sd, scc, gh, git, lazygit, wget, ast-grep, gum |
+| Python | ruff, JupyterLab, httpie — installed with `uv tool install` (isolated venv, shim in `~/.local/bin`) |
 | Julia | current stable release, via `juliaup add release` |
 | Editor | Neovim + LazyVim, node (for mason's npm-based LSP servers) |
 | Nominal | `nomctl` (the `nominal-cli` crate, via `cargo install`) |
