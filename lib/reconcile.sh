@@ -11,6 +11,11 @@
 [[ -n "${SETUP_RECONCILE_SOURCED:-}" ]] && return 0
 SETUP_RECONCILE_SOURCED=1
 
+# How each manager installs and upgrades lives in one place, so that this file
+# and bin/jarvis can't drift on the answer.
+# shellcheck source=lib/managers.sh
+source "$SETUP_REPO_DIR/lib/managers.sh"
+
 # ── Packages ─────────────────────────────────────────────────────────────────
 
 # Install everything lib/packages.sh probed and found absent. Idempotent by
@@ -38,61 +43,41 @@ install_missing_packages() {
     fi
   done
 
-  # One `brew install` per formula rather than one batched call, so a single
-  # formula that fails to build doesn't take the whole run down with it.
+  install_group brew ${MISSING_BREW_FORMULAE[@]+"${MISSING_BREW_FORMULAE[@]}"}
+  install_group cask ${MISSING_BREW_CASKS[@]+"${MISSING_BREW_CASKS[@]}"}
+  install_group uv ${MISSING_UV_TOOLS[@]+"${MISSING_UV_TOOLS[@]}"}
+  install_group cargo ${MISSING_CARGO_CRATES[@]+"${MISSING_CARGO_CRATES[@]}"}
+}
+
+# install_group <manager> [package...]
+#
+# One install call per package rather than one batched call per manager, so a
+# single formula that fails to build doesn't take the whole run down with it.
+# A manager that isn't on the machine reports what it skipped instead of
+# failing: that's the setup.sh-hasn't-run-yet case, not an error here.
+install_group() {
+  local mgr="$1"
+  shift
+  (($# > 0)) || return 0
+  if ! mgr_available "$mgr"; then
+    warn "$(mgr_label "$mgr") is missing, so $* were skipped; run ./setup.sh"
+    return 0
+  fi
   local pkg
-  for pkg in ${MISSING_BREW_FORMULAE[@]+"${MISSING_BREW_FORMULAE[@]}"}; do
-    if brew install "$pkg"; then ok "$pkg"; else warn "$pkg failed"; fi
+  for pkg in "$@"; do
+    if mgr_install "$mgr" "$pkg"; then ok "$pkg"; else warn "$pkg failed"; fi
   done
-
-  for pkg in ${MISSING_BREW_CASKS[@]+"${MISSING_BREW_CASKS[@]}"}; do
-    if brew install --cask "$pkg"; then ok "$pkg"; else warn "$pkg failed"; fi
-  done
-
-  if ((${#MISSING_UV_TOOLS[@]} > 0)); then
-    if have uv; then
-      for pkg in "${MISSING_UV_TOOLS[@]}"; do
-        if uv tool install "$pkg"; then ok "$pkg"; else warn "$pkg failed"; fi
-      done
-    else
-      warn "uv is missing, so ${MISSING_UV_TOOLS[*]} were skipped; run ./setup.sh"
-    fi
-  fi
-
-  if ((${#MISSING_CARGO_CRATES[@]} > 0)); then
-    load_cargo
-    if have cargo; then
-      for pkg in "${MISSING_CARGO_CRATES[@]}"; do
-        if cargo install "$pkg"; then ok "$pkg"; else warn "$pkg failed"; fi
-      done
-    else
-      warn "cargo is missing, so ${MISSING_CARGO_CRATES[*]} were skipped; run ./setup.sh"
-    fi
-  fi
 }
 
 # Upgrade what's already installed. Separate from the above and opt-in: filling
 # a gap is safe to do on every run, moving every version out from under you is
 # not.
+#
+# The list of managers and what "upgrade" means for each is lib/managers.sh's
+# business, not this file's — `jarvis upgrade` walks the same list, so there is
+# one answer to "how do I update everything" rather than two that drift.
 upgrade_everything() {
-  step "Upgrades"
-  if have brew; then
-    brew update && brew upgrade
-    ok "brew"
-  fi
-  if have uv; then
-    uv tool upgrade --all
-    ok "uv tools"
-  fi
-  load_cargo
-  if have rustup; then
-    rustup update
-    ok "rust toolchain"
-  fi
-  if have juliaup; then
-    juliaup update
-    ok "julia"
-  fi
+  mgr_upgrade_all "$@"
 }
 
 # Julia is its own function rather than a registry line because "installed" has
