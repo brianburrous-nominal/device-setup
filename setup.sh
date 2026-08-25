@@ -264,6 +264,8 @@ cat <<EOF
     bat       $(bat --version 2>/dev/null | awk '{print $2}')
     sd        $(sd --version 2>/dev/null | awk '{print $2}')
     scc       $(scc --version 2>/dev/null | awk '{print $3}')
+    nmap      $(nmap --version 2>/dev/null | awk '/^Nmap version/{print $3}')
+    shellcheck $(shellcheck --version 2>/dev/null | awk '/^version:/{print $2}')
     httpie    $(http --version 2>/dev/null)
     nomctl    $(nomctl --version 2>/dev/null | awk '{print $2}')
     julia     $(julia --version 2>/dev/null | awk '{print $3}')

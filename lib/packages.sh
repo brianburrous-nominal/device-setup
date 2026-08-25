@@ -135,6 +135,12 @@ brew_formula sd                # find-and-replace with plain regex instead of se
 brew_formula scc               # line/complexity counts per language
 brew_formula gum               # prompts/spinners/styling (bin/nomprofile needs it)
 brew_formula bat               # syntax-highlighted cat; rgv's preview pane uses it
+brew_formula shellcheck        # lints the scripts in this repo (and bin/*)
+# bin/netscan reads nmap's bundled IEEE OUI table to name MAC vendors; it never
+# runs nmap itself, and the scan works without it (minus the vendor column).
+# nmap's table is the reason to prefer it over arp-scan's, which is a years-old
+# snapshot missing Raspberry Pi and much of Ubiquiti.
+brew_formula nmap              # port scanner; also the MAC-vendor database
 # Tobi Lütke's experiment-directory manager. Its tap lives in a repo that isn't
 # named homebrew-try, so the URL has to be spelled out for `brew tap`.
 brew_formula try try tobi/try https://github.com/tobi/try

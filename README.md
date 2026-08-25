@@ -134,7 +134,7 @@ machines by `git pull` rather than by copy-paste.
 | Path in repo | Symlinked to | Holds |
 |---|---|---|
 | `zsh/rc.zsh` | `~/.config/zsh/rc.zsh` | PATH, exports, aliases, tool init, functions (`rgv`) |
-| `bin/*` | `~/.local/bin/*` | standalone scripts — `apply`, `identity`, `mdget`, `netif`, `nomprofile` |
+| `bin/*` | `~/.local/bin/*` | standalone scripts — `apply`, `identity`, `mdget`, `netif`, `netscan`, `nomprofile` |
 | `ssh/setup.conf` | `~/.ssh/config.d/setup.conf` | agent + keychain settings, pulled in by an `Include` |
 
 `setup.sh` adds exactly two lines to `~/.zshrc` and nothing else:
@@ -258,6 +258,48 @@ router; `-setmanual` with an empty router argument keeps the old one.
 It re-invokes itself to render the preview pane, resolving its own path with
 `${0:A}` — which resolves symlinks, so it finds the repo copy rather than the
 `~/.local/bin` symlink and keeps working under the link.
+
+**`netscan`** lists every device on a local IPv4 subnet — address, hostname, MAC
+and vendor — in about three seconds for a `/24`:
+
+```
+$ netscan
+IPV4          HOSTNAME                 MAC                VIA   VENDOR
+10.10.60.1    unifi                    0c:ea:14:4e:20:c9  icmp  Ubiquiti
+10.10.60.115  vltest5                  88:a2:9e:ac:75:4f  icmp  Raspberry Pi (Trading)
+10.10.60.130  Alexs-iPhone.local       f2:cf:24:a2:fc:00  arp   (randomized)
+10.10.60.253  NOM-Brian-Burrous.local  d6:ae:ae:43:49:a1  self  (randomized)
+```
+
+With no arguments it takes the subnet from the interface behind the default
+route; `-i en1` picks another one, or pass a range (`netscan 192.168.4.0/24`, or
+a bare IP, which is read as `/24`). `--json` emits the same rows as objects for
+scripting, `-A` skips the sweep and just prints the current ARP cache (instant),
+`-n` skips hostname lookups.
+
+Discovery is a parallel ICMP sweep — 256 pings in flight by default — followed
+by a read of the ARP cache. The sweep is really there to *force* ARP resolution:
+a device that drops pings still has to answer the ARP who-has to stay on the
+network, so the cache is a superset of the ping replies. That's what the `VIA`
+column records, and `arp` there is a real signal — the host is up but filtering
+ICMP, not absent. It needs no root and no scanner binary; `ping`, `arp` and
+`dig` all ship with macOS.
+
+Hostnames come from two sources, because on a typical network neither one knows
+every device: reverse DNS first (whatever the router registered from DHCP), then
+multicast DNS for the addresses unicast DNS didn't answer, which is where Macs,
+phones, printers and Pis announce themselves. mDNS is queried by pointing `dig`
+at `224.0.0.251:5353` rather than by parsing `dns-sd`, which has no
+non-interactive mode and won't exit on the first answer. Our own address is
+added by hand and named from `scutil` — nothing ARPs for or pings itself, and
+nothing else on the network announces us.
+
+Vendors are looked up in `nmap`'s bundled IEEE OUI table. Nothing runs nmap;
+only its data file is read, and the column is dropped if the file isn't there.
+It beats `arp-scan`'s `ieee-oui.txt`, whose snapshot is years old and missing
+Raspberry Pi and half of Ubiquiti. A MAC with the locally-administered bit set
+is labelled `(randomized)` rather than left blank — every current phone and
+laptop rotates one per network, so there is no vendor to find.
 
 **`add_path`** is how `rc.zsh` builds `PATH`: prepend, but only if the directory
 exists and isn't already there. Plain `PATH="$dir:$PATH"` lines duplicate every

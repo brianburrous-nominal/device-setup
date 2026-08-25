@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+#
+# netscan — list every device on a local IPv4 subnet: address, hostname, MAC.
+#
+#   netscan                    # the subnet behind the default route
+#   netscan -i en1             # a specific interface's subnet
+#   netscan 192.168.4.0/24     # an explicit range (bare IP means /24)
+#   netscan --json | jq .      # machine-readable
+#
+# Discovery is a parallel ICMP sweep of every host address in the subnet,
+# followed by a read of the kernel's ARP cache. The sweep is really a way to
+# force ARP resolution: a device that drops pings still has to answer the ARP
+# who-has to stay on the network, so the cache is a superset of the ping
+# replies. Those hosts show up with via=arp, which is a useful signal on its
+# own — it usually means a firewall, not an absent machine.
+#
+# Needs no root and no scanner binary: ping, arp and dig all ship with macOS.
+# MAC vendor names are read out of nmap's bundled IEEE OUI table (nmap is
+# declared in lib/packages.sh, and this only reads its data file — nmap itself
+# is never run). arp-scan's ieee-oui.txt is accepted as a fallback, but its
+# snapshot is years older and misses newer prefixes: Raspberry Pi and half of
+# Ubiquiti's registrations are absent from it. Without either table the vendor
+# column is dropped rather than printed empty.
+#
+# Hostnames are resolved from two sources, because on a typical network no
+# single one knows every device: reverse DNS first (the router's DHCP
+# registrations), then multicast DNS for anything unicast DNS didn't answer —
+# which is where Macs, phones, printers and Raspberry Pis announce themselves.
+# mDNS is queried by pointing dig at 224.0.0.251:5353 rather than by parsing
+# dns-sd, which has no non-interactive mode and no exit-on-first-answer.
+
+set -uo pipefail
+
+TIMEOUT=300     # per-host ICMP wait, ms
+JOBS=256        # concurrent probes
+RESOLVE=true
+SWEEP=true
+JSON=false
+VENDOR=true
+IFACE=""
+TARGET=""
+MAX_HOSTS=4096  # a /20; past this a sweep is the wrong tool
+
+SELF_NAME=netscan
+
+die() {
+  printf '%s: %s\n' "$SELF_NAME" "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+usage: netscan [options] [target]
+
+  target            CIDR (10.0.0.0/24) or a bare IPv4 address, which is read
+                    as /24. Default: the subnet of the interface below.
+
+  -i, --interface   interface to take the subnet from (default: default route)
+  -t, --timeout MS  per-host ICMP wait in milliseconds (default 300)
+  -j, --jobs N      concurrent probes (default 256)
+  -n, --no-resolve  skip hostname lookups
+  -A, --arp-only    don't sweep, just report the current ARP cache
+      --no-vendor   skip MAC vendor lookup
+      --json        JSON array on stdout (needs jq)
+  -h, --help        this
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -i | --interface) IFACE="${2:-}"; [[ -n "$IFACE" ]] || die "--interface needs a value"; shift 2 ;;
+    -t | --timeout) TIMEOUT="${2:-}"; shift 2 ;;
+    -j | --jobs) JOBS="${2:-}"; shift 2 ;;
+    -n | --no-resolve) RESOLVE=false; shift ;;
+    -A | --arp-only) SWEEP=false; shift ;;
+    --no-vendor) VENDOR=false; shift ;;
+    --json) JSON=true; shift ;;
+    -h | --help) usage; exit 0 ;;
+    -*) die "unknown option: $1 (try --help)" ;;
+    *)
+      [[ -z "$TARGET" ]] || die "more than one target given"
+      TARGET="$1"
+      shift
+      ;;
+  esac
+done
+
+[[ "$TIMEOUT" =~ ^[0-9]+$ && "$TIMEOUT" -gt 0 ]] || die "--timeout must be a positive integer (ms)"
+[[ "$JOBS" =~ ^[0-9]+$ && "$JOBS" -gt 0 ]] || die "--jobs must be a positive integer"
+
+for c in ping arp; do
+  command -v "$c" >/dev/null 2>&1 || die "missing dependency: $c"
+done
+if [[ "$RESOLVE" == true ]] && ! command -v dig >/dev/null 2>&1; then
+  printf '%s: dig not found — hostnames will be blank\n' "$SELF_NAME" >&2
+  RESOLVE=false
+fi
+if [[ "$JSON" == true ]]; then
+  command -v jq >/dev/null 2>&1 || die "--json needs jq"
+fi
+
+# ---------------------------------------------------------------------------
+# Address arithmetic. Everything internal is a 32-bit integer; IPs are only
+# formatted back at the edges.
+# ---------------------------------------------------------------------------
+valid_ip() {
+  local o1 o2 o3 o4 rest
+  IFS=. read -r o1 o2 o3 o4 rest <<<"$1"
+  [[ -z "${rest:-}" ]] || return 1
+  local o
+  for o in "$o1" "$o2" "$o3" "$o4"; do
+    [[ "$o" =~ ^[0-9]+$ ]] || return 1
+    ((o >= 0 && o <= 255)) || return 1
+  done
+  return 0
+}
+
+ip2int() {
+  local o1 o2 o3 o4
+  IFS=. read -r o1 o2 o3 o4 <<<"$1"
+  printf '%s\n' $(((o1 << 24) | (o2 << 16) | (o3 << 8) | o4))
+}
+
+int2ip() {
+  printf '%d.%d.%d.%d\n' $((($1 >> 24) & 255)) $((($1 >> 16) & 255)) \
+    $((($1 >> 8) & 255)) $(($1 & 255))
+}
+
+# ifconfig prints the mask as 0xffffff00. Convert to a prefix length, and
+# reject a mask with holes in it rather than silently scanning the wrong range.
+hexmask_to_prefix() {
+  local n=$((16#${1#0x})) bits=0 i
+  for ((i = 31; i >= 0; i--)); do
+    (((n >> i) & 1)) || break
+    bits=$((bits + 1))
+  done
+  local canonical=0
+  ((bits > 0)) && canonical=$(((0xffffffff << (32 - bits)) & 0xffffffff))
+  ((n == canonical)) || die "non-contiguous subnet mask: $1"
+  printf '%s\n' "$bits"
+}
+
+default_iface() {
+  route -n get default 2>/dev/null | awk '/interface:/ { print $2; exit }'
+}
+
+# "ip<TAB>hexmask" for an interface's first IPv4 address.
+iface_inet() {
+  ifconfig "$1" 2>/dev/null | awk '
+    /[[:space:]]inet [0-9]/ {
+      ip = $2
+      for (i = 1; i <= NF; i++) if ($i == "netmask") m = $(i + 1)
+      print ip "\t" m
+      exit
+    }'
+}
+
+# First usable PTR answer on stdin, with the trailing dot stripped.
+ptr_answer() {
+  awk '
+    /^;/ { next }
+    NF == 1 && $1 ~ /^[A-Za-z0-9_.-]+\.?$/ {
+      sub(/\.$/, "", $1)
+      if ($1 != "") { print $1; exit }
+    }'
+}
+
+iface_mac() {
+  ifconfig "$1" 2>/dev/null | awk '/[[:space:]]ether /{ print $2; exit }'
+}
+
+# ---------------------------------------------------------------------------
+# Work out what to scan
+# ---------------------------------------------------------------------------
+SELF_IP=""
+PREFIX=""
+NET_INT=""
+
+if [[ -n "$TARGET" ]]; then
+  base="${TARGET%%/*}"
+  if [[ "$TARGET" == */* ]]; then
+    PREFIX="${TARGET##*/}"
+    if ! [[ "$PREFIX" =~ ^[0-9]+$ ]] || ((PREFIX > 32)); then
+      die "bad prefix length in $TARGET"
+    fi
+  else
+    PREFIX=24
+  fi
+  valid_ip "$base" || die "not an IPv4 address: $base"
+  NET_INT=$((($(ip2int "$base") >> (32 - PREFIX)) << (32 - PREFIX)))
+  # A target given by hand still wants an interface: it scopes the ARP cache
+  # read, and gives us our own address on that link. Prefer the interface
+  # whose subnet contains the target, so scanning a VLAN we're on works.
+  if [[ -z "$IFACE" ]]; then
+    for dev in $(ifconfig -l 2>/dev/null); do
+      IFS=$'\t' read -r dev_ip dev_mask <<<"$(iface_inet "$dev")"
+      [[ -n "${dev_ip:-}" && -n "${dev_mask:-}" ]] || continue
+      if ((($(ip2int "$dev_ip") >> (32 - PREFIX) << (32 - PREFIX)) == NET_INT)); then
+        IFACE="$dev"
+        SELF_IP="$dev_ip"
+        break
+      fi
+    done
+  fi
+else
+  [[ -n "$IFACE" ]] || IFACE="$(default_iface)"
+  [[ -n "$IFACE" ]] || die "no default route — name an interface with -i, or give a target"
+  IFS=$'\t' read -r self_ip hexmask <<<"$(iface_inet "$IFACE")"
+  [[ -n "${self_ip:-}" ]] || die "$IFACE has no IPv4 address"
+  [[ -n "${hexmask:-}" ]] || die "$IFACE has no subnet mask"
+  SELF_IP="$self_ip"
+  PREFIX="$(hexmask_to_prefix "$hexmask")"
+  NET_INT=$((($(ip2int "$SELF_IP") >> (32 - PREFIX)) << (32 - PREFIX)))
+fi
+
+if [[ -n "$IFACE" && -z "$SELF_IP" ]]; then
+  IFS=$'\t' read -r self_ip _ <<<"$(iface_inet "$IFACE")"
+  SELF_IP="${self_ip:-}"
+fi
+
+BCAST_INT=$((NET_INT | ((1 << (32 - PREFIX)) - 1)))
+if ((PREFIX >= 31)); then
+  # /31 and /32 have no network or broadcast address to skip.
+  FIRST_INT=$NET_INT
+  LAST_INT=$BCAST_INT
+else
+  FIRST_INT=$((NET_INT + 1))
+  LAST_INT=$((BCAST_INT - 1))
+fi
+HOST_COUNT=$((LAST_INT - FIRST_INT + 1))
+CIDR="$(int2ip "$NET_INT")/$PREFIX"
+
+if [[ "$SWEEP" == true ]] && ((HOST_COUNT > MAX_HOSTS)); then
+  die "$CIDR is $HOST_COUNT addresses — too many to sweep. Narrow the prefix, or use --arp-only."
+fi
+
+# ---------------------------------------------------------------------------
+# Sweep. One backgrounded ping per address, in batches of --jobs. A reply
+# leaves a marker file behind; the ARP cache read afterwards is what catches
+# the hosts that never reply.
+# ---------------------------------------------------------------------------
+TMP="$(mktemp -d -t netscan)" || die "could not create a temp dir"
+trap 'rm -rf "$TMP"' EXIT INT TERM
+mkdir -p "$TMP/up" "$TMP/names"
+
+start_epoch=$SECONDS
+
+if [[ "$SWEEP" == true ]]; then
+  # -W is milliseconds, -t is a whole-second ceiling on the run, so it has to
+  # be rounded up or a --timeout above 1000ms would be cut short by it.
+  ping_secs=$(((TIMEOUT + 999) / 1000))
+  printf '%s: sweeping %s host addresses on %s (%s)...\n' \
+    "$SELF_NAME" "$HOST_COUNT" "$CIDR" "${IFACE:-?}" >&2
+  started=0
+  for ((n = FIRST_INT; n <= LAST_INT; n++)); do
+    ip="$(int2ip "$n")"
+    {
+      if ping -c 1 -W "$TIMEOUT" -t "$ping_secs" -n -q "$ip" >/dev/null 2>&1; then
+        : >"$TMP/up/$ip"
+      fi
+    } &
+    started=$((started + 1))
+    ((started % JOBS == 0)) && wait
+  done
+  wait
+fi
+
+# ---------------------------------------------------------------------------
+# Collect: ARP cache ∩ target subnet, plus the ping repliers, plus ourselves.
+# ---------------------------------------------------------------------------
+# `arp -an` lines look like:
+#   ? (10.0.0.1) at c:ea:14:4e:20:c9 on en0 ifscope [ethernet]
+# Octets are not zero-padded, hence the normalising printf below.
+arp -an 2>/dev/null | awk -v ifc="${IFACE:-}" '
+  /incomplete/ { next }
+  {
+    ip = $2
+    gsub(/[()]/, "", ip)
+    mac = $4
+    dev = ""
+    for (i = 1; i <= NF; i++) if ($i == "on") dev = $(i + 1)
+    if (ifc != "" && dev != "" && dev != ifc) next
+    if (ip !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) next
+    if (mac !~ /:/) next
+    print ip "\t" mac
+  }' | sort -u >"$TMP/arp.raw"
+
+: >"$TMP/arp.tsv"
+while IFS=$'\t' read -r ip mac; do
+  [[ -n "$ip" ]] || continue
+  n="$(ip2int "$ip")"
+  ((n >= FIRST_INT && n <= LAST_INT)) || continue
+  IFS=: read -r m1 m2 m3 m4 m5 m6 <<<"$mac"
+  printf '%s\t%02x:%02x:%02x:%02x:%02x:%02x\n' "$ip" \
+    $((16#${m1:-0})) $((16#${m2:-0})) $((16#${m3:-0})) \
+    $((16#${m4:-0})) $((16#${m5:-0})) $((16#${m6:-0})) >>"$TMP/arp.tsv"
+done <"$TMP/arp.raw"
+
+# ip -> mac, and the set of addresses to report on
+mac_of() { awk -F'\t' -v k="$1" '$1 == k { print $2; exit }' "$TMP/arp.tsv"; }
+
+{
+  cut -f1 "$TMP/arp.tsv"
+  ls -1 "$TMP/up" 2>/dev/null
+  # We never ARP for or ping ourselves, so our own address has to be added by
+  # hand — it is a device on the subnet like any other.
+  if [[ -n "$SELF_IP" ]]; then
+    n="$(ip2int "$SELF_IP")"
+    ((n >= FIRST_INT && n <= LAST_INT)) && printf '%s\n' "$SELF_IP"
+  fi
+} | sort -u >"$TMP/ips"
+
+# ---------------------------------------------------------------------------
+# Hostnames, in parallel — reverse DNS, then mDNS for whatever is left.
+# ---------------------------------------------------------------------------
+if [[ "$RESOLVE" == true ]] && [[ -s "$TMP/ips" ]]; then
+  started=0
+  while read -r ip; do
+    [[ -n "$ip" ]] || continue
+    {
+      # A dig that gets no answer still writes its banner and ";; connection
+      # timed out" to stdout, +short or not, so anything starting with ';' has
+      # to go — and a PTR is a single name, so a line with a space in it isn't
+      # one either.
+      name="$(dig -x "$ip" +short +time=1 +tries=1 2>/dev/null | ptr_answer)"
+      [[ -n "$name" ]] ||
+        name="$(dig -x "$ip" @224.0.0.251 -p 5353 +short +time=1 +tries=1 2>/dev/null | ptr_answer)"
+      printf '%s\n' "$name" >"$TMP/names/$ip"
+    } &
+    started=$((started + 1))
+    ((started % JOBS == 0)) && wait
+  done <"$TMP/ips"
+  wait
+fi
+
+# Our own name doesn't come back from either lookup on most networks: nothing
+# else announces it for us. scutil knows it.
+if [[ "$RESOLVE" == true && -n "$SELF_IP" ]]; then
+  resolved=""
+  [[ -r "$TMP/names/$SELF_IP" ]] && read -r resolved <"$TMP/names/$SELF_IP"
+  if [[ -z "$resolved" ]]; then
+    self_name="$(scutil --get LocalHostName 2>/dev/null)"
+    [[ -n "$self_name" ]] && printf '%s.local\n' "$self_name" >"$TMP/names/$SELF_IP"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# MAC vendor, from nmap's OUI table (or arp-scan's) if one is on disk
+# ---------------------------------------------------------------------------
+OUI_DB=""
+if [[ "$VENDOR" == true ]]; then
+  for db in \
+    "${HOMEBREW_PREFIX:-/opt/homebrew}/share/nmap/nmap-mac-prefixes" \
+    /opt/homebrew/share/nmap/nmap-mac-prefixes \
+    /usr/local/share/nmap/nmap-mac-prefixes \
+    /usr/share/nmap/nmap-mac-prefixes \
+    "${HOMEBREW_PREFIX:-/opt/homebrew}/share/arp-scan/ieee-oui.txt" \
+    /usr/local/share/arp-scan/ieee-oui.txt; do
+    if [[ -r "$db" ]]; then
+      OUI_DB="$db"
+      break
+    fi
+  done
+fi
+
+# ---------------------------------------------------------------------------
+# Assemble rows: ip, hostname, mac, vendor, via
+# ---------------------------------------------------------------------------
+: >"$TMP/rows.tsv"
+while read -r ip; do
+  [[ -n "$ip" ]] || continue
+  mac="$(mac_of "$ip")"
+  name=""
+  [[ -r "$TMP/names/$ip" ]] && read -r name <"$TMP/names/$ip"
+  if [[ "$ip" == "$SELF_IP" ]]; then
+    via=self
+    [[ -n "$mac" ]] || mac="$(iface_mac "${IFACE:-}")"
+  elif [[ -e "$TMP/up/$ip" ]]; then
+    via=icmp
+  else
+    via=arp
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$ip" "${name:--}" "${mac:--}" "$via" >>"$TMP/rows.tsv"
+done < <(sort -t. -k1,1n -k2,2n -k3,3n -k4,4n "$TMP/ips")
+
+# Vendor column: one pass over the OUI table, keyed by the first three octets.
+if [[ -n "$OUI_DB" ]]; then
+  awk -F'\t' -v db="$OUI_DB" '
+    # Both known table formats are "<6 hex><separator><vendor>" — nmap
+    # separates with a space, arp-scan with a tab — so take the prefix off the
+    # front and whatever is left, trimmed, is the vendor.
+    BEGIN {
+      while ((getline line < db) > 0) {
+        if (line !~ /^[0-9A-Fa-f]{6}[ \t]/) continue
+        name = substr(line, 8)
+        sub(/^[ \t]+/, "", name)
+        sub(/[ \t]+$/, "", name)
+        if (name != "") v[toupper(substr(line, 1, 6))] = name
+      }
+    }
+    # Bit 0x02 of the first octet marks a locally administered address. On a
+    # LAN that means a randomized MAC — every current phone and laptop rotates
+    # one per network — so there is no vendor to look up, and labelling it is
+    # more use than a dash that reads like a failed lookup.
+    # No and() in BSD awk, which is what /usr/bin/awk is here, so test the bit
+    # arithmetically.
+    function randomized(mac,   o, first) {
+      split(mac, o, ":")
+      first = hex(o[1])
+      if (first < 0) return 0
+      return int(first / 2) % 2 == 1
+    }
+    function hex(s,   i, c, n, d) {
+      n = 0
+      s = toupper(s)
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        d = index("0123456789ABCDEF", c) - 1
+        if (d < 0) return -1
+        n = n * 16 + d
+      }
+      return n
+    }
+    {
+      oui = toupper($3)
+      gsub(/:/, "", oui)
+      oui = substr(oui, 1, 6)
+      if (oui in v)                            name = v[oui]
+      else if ($3 != "-" && randomized($3))    name = "(randomized)"
+      else                                     name = "-"
+      print $1 "\t" $2 "\t" $3 "\t" name "\t" $4
+    }' "$TMP/rows.tsv" >"$TMP/rows.v.tsv"
+  mv "$TMP/rows.v.tsv" "$TMP/rows.tsv"
+else
+  awk -F'\t' '{ print $1 "\t" $2 "\t" $3 "\t-\t" $4 }' "$TMP/rows.tsv" >"$TMP/rows.v.tsv"
+  mv "$TMP/rows.v.tsv" "$TMP/rows.tsv"
+fi
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+found=$(wc -l <"$TMP/rows.tsv" | tr -d ' ')
+elapsed=$((SECONDS - start_epoch))
+
+if [[ "$JSON" == true ]]; then
+  jq -R -s --arg cidr "$CIDR" --arg iface "${IFACE:-}" '
+    split("\n")
+    | map(select(length > 0) | split("\t")
+          | { ip: .[0],
+              hostname: (if .[1] == "-" then null else .[1] end),
+              mac: (if .[2] == "-" then null else .[2] end),
+              vendor: (if .[3] == "-" then null else .[3] end),
+              via: .[4],
+              subnet: $cidr,
+              interface: (if $iface == "" then null else $iface end) })' \
+    <"$TMP/rows.tsv"
+else
+  if ((found == 0)); then
+    printf '%s: nothing found on %s\n' "$SELF_NAME" "$CIDR" >&2
+  else
+    # Widths from the data, so a long hostname or vendor doesn't wrap the row.
+    awk -F'\t' -v show_vendor="$([[ -n "$OUI_DB" ]] && echo 1 || echo 0)" '
+      {
+        rows[NR] = $0
+        if (length($1) > w1) w1 = length($1)
+        if (length($2) > w2) w2 = length($2)
+        if (length($3) > w3) w3 = length($3)
+      }
+      END {
+        if (w1 < 4) w1 = 4          # IPV4
+        if (w2 < 8) w2 = 8          # HOSTNAME
+        if (w3 < 3) w3 = 3          # MAC
+        fmt = "%-" w1 "s  %-" w2 "s  %-" w3 "s  %-4s"
+        if (show_vendor) fmt = fmt "  %s"
+        if (show_vendor) printf fmt "\n", "IPV4", "HOSTNAME", "MAC", "VIA", "VENDOR"
+        else             printf fmt "\n", "IPV4", "HOSTNAME", "MAC", "VIA"
+        for (i = 1; i <= NR; i++) {
+          split(rows[i], f, "\t")
+          if (show_vendor) printf fmt "\n", f[1], f[2], f[3], f[5], f[4]
+          else             printf fmt "\n", f[1], f[2], f[3], f[5]
+        }
+      }' "$TMP/rows.tsv"
+  fi
+  [[ "$found" -eq 1 ]] && plural="" || plural="s"
+  printf '%s: %s device%s on %s%s in %ss\n' \
+    "$SELF_NAME" "$found" "$plural" "$CIDR" "${IFACE:+ ($IFACE)}" "$elapsed" >&2
+fi
