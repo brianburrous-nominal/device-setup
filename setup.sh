@@ -3,7 +3,7 @@
 # setup-mac.sh — bootstrap a macOS dev environment.
 #
 # Installs: Homebrew, Oh My Zsh, uv, Neovim + LazyVim, try, zoxide,
-#           ripgrep (rg), fd, jq, and Rust/cargo via rustup.
+#           ripgrep (rg), fd, jq, gum, ruff, pnpm, and Rust/cargo via rustup.
 #
 # Also copies this repo's nvim/ overlay over the LazyVim starter. That overlay
 # is what makes `:LazyHealth` come back clean; each file explains itself.
@@ -144,8 +144,10 @@ BREW_FORMULAE=(
   fzf      # LazyVim + general fuzzy finding
   lazygit  # LazyVim's git UI
   node     # npm-based LSP servers + formatters that mason installs
+  pnpm     # fast npm alternative (needs the node above)
   wget     # mason falls back to it when curl is unavailable
   ast-grep # structural search/replace backend for grug-far.nvim
+  gum      # prompts/spinners/styling for shell scripts
 )
 for f in "${BREW_FORMULAE[@]}"; do
   if brew list --formula "$f" >/dev/null 2>&1; then
@@ -170,6 +172,27 @@ if [[ "$INSTALL_NERD_FONT" == true ]]; then
   # stops LazyVim's statusline and file tree from drifting out of alignment.
   warn "set your terminal font to 'JetBrainsMono NFM' or LazyVim icons render as boxes"
 fi
+
+# ---------------------------------------------------------------------------
+# 3b. Python CLI tools via uv
+#     `uv tool install` rather than brew: each tool gets its own isolated venv
+#     under ~/.local/share/uv/tools with a shim in ~/.local/bin, and
+#     `uv tool upgrade --all` updates them without touching project envs.
+# ---------------------------------------------------------------------------
+step "Python CLI tools (uv)"
+# uv drops its shims here. Future shells get this from .zshrc below; export it
+# now so the rest of this script (the summary block) can see the tools too.
+export PATH="$HOME/.local/bin:$PATH"
+UV_TOOLS=(
+  ruff # Python linter + formatter
+)
+for t in "${UV_TOOLS[@]}"; do
+  if uv tool list 2>/dev/null | grep -q "^$t "; then
+    skip "$t already installed"
+  else
+    uv tool install "$t" && ok "$t"
+  fi
+done
 
 # ---------------------------------------------------------------------------
 # 4. try (Tobi Lütke's experiment-directory manager)
@@ -272,6 +295,11 @@ append_once '# --- added by setup-mac.sh ---' "$ZSHRC"
 # PATH and environment
 append_once 'export PATH="$HOME/.local/bin:$PATH"' "$ZSHRC" # claude, pipx, etc.
 append_once 'export PATH="$HOME/.cargo/bin:$PATH"' "$ZSHRC"
+# pnpm puts globally-installed binaries in $PNPM_HOME/bin. Setting this by
+# hand rather than running `pnpm setup`, which appends its own block to
+# .zshrc and would duplicate on every re-run.
+append_once 'export PNPM_HOME="$HOME/Library/pnpm"' "$ZSHRC"
+append_once 'export PATH="$PNPM_HOME/bin:$PATH"' "$ZSHRC"
 append_once "export TRY_PATH=\"$TRY_PATH_DIR\"" "$ZSHRC"
 append_once 'export EDITOR="nvim"' "$ZSHRC"
 append_once 'alias vim="nvim"' "$ZSHRC"
@@ -316,6 +344,9 @@ cat <<EOF
     atuin     $(atuin --version 2>/dev/null | awk '{print $2}')
     direnv    $(direnv version 2>/dev/null)
     gh        $(gh --version 2>/dev/null | head -1 | awk '{print $3}')
+    gum       $(gum --version 2>/dev/null | awk '{print $3}')
+    pnpm      $(pnpm --version 2>/dev/null)
+    ruff      $(ruff --version 2>/dev/null | awk '{print $2}')
     try       $(try --version 2>/dev/null | head -1 || echo "installed")
 
   Next:

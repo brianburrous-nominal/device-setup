@@ -16,9 +16,10 @@ added to a shell config is added only once.
 
 | | |
 |---|---|
-| Package managers | Homebrew, uv, rustup (cargo) |
+| Package managers | Homebrew, uv, rustup (cargo), pnpm |
 | Shell | Oh My Zsh, atuin, zoxide, direnv, fzf |
-| CLI | ripgrep, fd, jq, eza, gh, git, lazygit, wget, ast-grep |
+| CLI | ripgrep, fd, jq, eza, gh, git, lazygit, wget, ast-grep, gum |
+| Python | ruff, installed with `uv tool install` (isolated venv, shim in `~/.local/bin`) |
 | Editor | Neovim + LazyVim, node (for mason's npm-based LSP servers) |
 | Other | `try` for scratch directories, JetBrainsMono Nerd Font |
 
