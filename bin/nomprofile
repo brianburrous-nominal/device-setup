@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+#
+# nomprofile — a gum-powered TUI for `nomctl config profile add`
+#
+# Usage: ./nomprofile
+#
+# Requires: gum (https://github.com/charmbracelet/gum), nomctl
+
+set -uo pipefail
+
+DEFAULT_URL="https://api.gov.nominal.io/api"
+
+# ── theme ─────────────────────────────────────────────────────────────────────
+ACCENT=212   # pink
+MUTED=244    # grey
+OK=42        # green
+WARN=214     # orange
+ERR=203      # red
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+die() {
+  gum style --foreground "$ERR" "✗ $*" >&2
+  exit 1
+}
+
+abort() {
+  echo
+  gum style --foreground "$MUTED" "Cancelled. Nothing was written."
+  exit 130
+}
+
+info()  { gum style --foreground "$MUTED" "$*"; }
+label() { gum style --foreground "$ACCENT" --bold "$*"; }
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "'$1' not found in PATH."
+}
+
+# Mask a secret for display: keep a little head and tail, hide the middle.
+mask() {
+  local s="$1" n=${#1}
+  if (( n <= 12 )); then
+    printf '%s' "$(printf '•%.0s' $(seq 1 "$n"))"
+  else
+    printf '%s…%s (%d chars)' "${s:0:4}" "${s: -4}" "$n"
+  fi
+}
+
+# Does a profile with this name already exist?
+# Prefers `show` (exact, exit-code driven); falls back to scanning `list`.
+profile_exists() {
+  local name="$1"
+  if nomctl config profile show "$name" >/dev/null 2>&1; then
+    return 0
+  fi
+  nomctl config profile list 2>/dev/null \
+    | grep -qE "(^|[[:space:]\"'])${name}([[:space:]\"':,]|$)"
+}
+
+# ── preflight ─────────────────────────────────────────────────────────────────
+need gum
+need nomctl
+
+clear
+gum style \
+  --border double --border-foreground "$ACCENT" \
+  --padding "1 3" --margin "1 0" --align center \
+  "$(gum style --foreground "$ACCENT" --bold 'nomctl profile setup')" \
+  "$(gum style --foreground "$MUTED" 'create a new Nominal CLI profile')"
+
+# ── 1. profile name ───────────────────────────────────────────────────────────
+OVERWRITE=false
+
+while true; do
+  label "Profile name"
+  info "A short handle you'll pass to --profile, e.g. 'default' or 'staging'."
+
+  NAME=$(gum input \
+    --placeholder "default" \
+    --prompt "❯ " \
+    --prompt.foreground "$ACCENT" \
+    --width 50) || abort
+
+  NAME="${NAME// /}"
+
+  if [[ -z "$NAME" ]]; then
+    gum style --foreground "$WARN" "  Name can't be empty."
+    echo
+    continue
+  fi
+
+  if [[ ! "$NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    gum style --foreground "$WARN" "  Use only letters, numbers, dot, dash or underscore."
+    echo
+    continue
+  fi
+
+  if profile_exists "$NAME"; then
+    echo
+    gum style --foreground "$WARN" "  A profile named '$NAME' already exists."
+    CHOICE=$(gum choose \
+      --header "  What would you like to do?" \
+      --header.foreground "$MUTED" \
+      --cursor.foreground "$ACCENT" \
+      "Pick a different name" \
+      "Overwrite '$NAME'" \
+      "Quit") || abort
+
+    case "$CHOICE" in
+      "Pick a different name") echo; continue ;;
+      "Overwrite"*)            OVERWRITE=true; break ;;
+      *)                       abort ;;
+    esac
+  fi
+
+  break
+done
+
+echo
+
+# ── 2. url ────────────────────────────────────────────────────────────────────
+label "API URL"
+info "Press enter to accept the default: $DEFAULT_URL"
+
+URL=$(gum input \
+  --placeholder "$DEFAULT_URL" \
+  --prompt "❯ " \
+  --prompt.foreground "$ACCENT" \
+  --width 70) || abort
+
+URL="${URL// /}"
+URL="${URL:-$DEFAULT_URL}"
+URL="${URL%/}"   # strip a trailing slash
+
+if [[ ! "$URL" =~ ^https?:// ]]; then
+  gum style --foreground "$WARN" "  Heads up: '$URL' doesn't start with http:// or https://"
+fi
+
+echo
+
+# ── 3. token ──────────────────────────────────────────────────────────────────
+label "API token"
+info "Input is hidden. Paste works normally."
+
+while true; do
+  TOKEN=$(gum input \
+    --password \
+    --placeholder "paste token" \
+    --prompt "❯ " \
+    --prompt.foreground "$ACCENT" \
+    --width 50) || abort
+
+  TOKEN="${TOKEN//[$'\t\r\n ']/}"
+
+  [[ -n "$TOKEN" ]] && break
+  gum style --foreground "$WARN" "  Token can't be empty."
+done
+
+echo
+
+# ── 4. workspace rid ──────────────────────────────────────────────────────────
+label "Workspace RID"
+info "Looks like: ri.workspace.<realm>.workspace.<uuid>"
+
+while true; do
+  RID=$(gum input \
+    --placeholder "ri.workspace..." \
+    --prompt "❯ " \
+    --prompt.foreground "$ACCENT" \
+    --width 70) || abort
+
+  RID="${RID//[$'\t\r\n ']/}"
+
+  if [[ -z "$RID" ]]; then
+    gum style --foreground "$WARN" "  Workspace RID can't be empty."
+    continue
+  fi
+
+  if [[ ! "$RID" =~ ^ri\. ]]; then
+    gum confirm "  That doesn't look like a RID. Use it anyway?" \
+      --affirmative "Use it" --negative "Re-enter" || continue
+  fi
+
+  break
+done
+
+echo
+
+# ── 5. review ─────────────────────────────────────────────────────────────────
+VERB="Create"
+$OVERWRITE && VERB="Overwrite"
+
+gum style \
+  --border rounded --border-foreground "$ACCENT" \
+  --padding "1 2" --margin "1 0" \
+  "$(gum style --bold "$VERB profile")" \
+  "" \
+  "$(printf '%-14s %s' 'name'      "$NAME")" \
+  "$(printf '%-14s %s' 'url'       "$URL")" \
+  "$(printf '%-14s %s' 'token'     "$(mask "$TOKEN")")" \
+  "$(printf '%-14s %s' 'workspace' "$RID")"
+
+gum confirm "Write this profile?" \
+  --affirmative "Write it" \
+  --negative "Cancel" \
+  --selected.background "$ACCENT" || abort
+
+# ── 6. run it ─────────────────────────────────────────────────────────────────
+OUT=$(mktemp)
+trap 'rm -f "$OUT"' EXIT
+
+gum spin --spinner dot --title "Writing profile '$NAME'..." -- \
+  nomctl config profile add \
+    --url "$URL" \
+    --token "$TOKEN" \
+    --workspace-rid "$RID" \
+    "$NAME" >"$OUT" 2>&1
+
+STATUS=$?
+
+if (( STATUS != 0 )); then
+  gum style --foreground "$ERR" --bold "✗ nomctl exited with status $STATUS"
+  [[ -s "$OUT" ]] && gum style --border rounded --border-foreground "$ERR" \
+    --padding "0 2" --margin "1 0" "$(cat "$OUT")"
+  exit "$STATUS"
+fi
+
+gum style --foreground "$OK" --bold "✓ Profile '$NAME' saved."
+echo
+info "Inspect it with:  nomctl config profile show $NAME"
+info "List all with:    nomctl config profile list"

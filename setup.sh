@@ -3,7 +3,12 @@
 # setup-mac.sh — bootstrap a macOS dev environment.
 #
 # Installs: Homebrew, Oh My Zsh, uv, Neovim + LazyVim, try, zoxide,
-#           ripgrep (rg), fd, jq, gum, ruff, pnpm, and Rust/cargo via rustup.
+#           ripgrep (rg), fd, jq, gum, bat, ruff, pnpm, JupyterLab,
+#           Julia via juliaup, nomctl, and Rust/cargo via rustup.
+#
+# Shell config lives in zsh/rc.zsh in this repo, symlinked into place. ~/.zshrc
+# only ever gets two source lines from us, so Oh My Zsh keeps owning that file
+# and this repo stays the source of truth for everything portable.
 #
 # Also copies this repo's nvim/ overlay over the LazyVim starter. That overlay
 # is what makes `:LazyHealth` come back clean; each file explains itself.
@@ -55,6 +60,23 @@ append_once() {
     return 0
   fi
   printf '%s\n' "$line" >>"$file"
+}
+
+# Symlink src -> dst, moving anything already at dst out of the way. Symlinks
+# rather than copies so edits in this repo are live without a re-run.
+link_file() {
+  local src="$1" dst="$2" label="${3:-$(basename "$2")}"
+  if [[ -L "$dst" && "$(readlink "$dst")" == "$src" ]]; then
+    skip "$label already linked"
+    return 0
+  fi
+  mkdir -p "$(dirname "$dst")"
+  if [[ -e "$dst" || -L "$dst" ]]; then
+    mv "$dst" "$dst.bak-$STAMP"
+    warn "$label existed; moved aside to $(basename "$dst").bak-$STAMP"
+  fi
+  ln -s "$src" "$dst"
+  ok "$label linked"
 }
 
 # ---------------------------------------------------------------------------
@@ -147,7 +169,8 @@ BREW_FORMULAE=(
   pnpm     # fast npm alternative (needs the node above)
   wget     # mason falls back to it when curl is unavailable
   ast-grep # structural search/replace backend for grug-far.nvim
-  gum      # prompts/spinners/styling for shell scripts
+  gum      # prompts/spinners/styling for shell scripts (bin/nomprofile needs it)
+  bat      # syntax-highlighted cat; rgv's preview pane uses it
 )
 for f in "${BREW_FORMULAE[@]}"; do
   if brew list --formula "$f" >/dev/null 2>&1; then
@@ -184,7 +207,8 @@ step "Python CLI tools (uv)"
 # now so the rest of this script (the summary block) can see the tools too.
 export PATH="$HOME/.local/bin:$PATH"
 UV_TOOLS=(
-  ruff # Python linter + formatter
+  ruff       # Python linter + formatter
+  jupyterlab # notebooks; launches as `jupyter-lab`, see note below
 )
 for t in "${UV_TOOLS[@]}"; do
   if uv tool list 2>/dev/null | grep -q "^$t "; then
@@ -193,6 +217,15 @@ for t in "${UV_TOOLS[@]}"; do
     uv tool install "$t" && ok "$t"
   fi
 done
+
+# `uv tool install` only shims the named package's own entry points, and the
+# bare `jupyter` command belongs to jupyter-core (a dependency). So the habitual
+# `jupyter lab` isn't available -- use `jupyter-lab`. Installing jupyter-core as
+# its own tool would shim `jupyter`, but in a separate venv that can't see
+# JupyterLab, which is worse.
+if uv tool list 2>/dev/null | grep -q "^jupyterlab "; then
+  warn "launch notebooks with 'jupyter-lab' (no bare 'jupyter' shim; see comment above)"
+fi
 
 # ---------------------------------------------------------------------------
 # 4. try (Tobi Lütke's experiment-directory manager)
@@ -222,6 +255,51 @@ else
 fi
 # shellcheck source=/dev/null
 [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
+
+# ---------------------------------------------------------------------------
+# 5a. Rust CLI tools via cargo
+#     Crates with no Homebrew formula. `cargo install` puts binaries in
+#     ~/.cargo/bin, which zsh/rc.zsh already has on PATH.
+# ---------------------------------------------------------------------------
+step "Rust CLI tools (cargo)"
+# crate name -> binary it provides, since the two differ for nominal-cli.
+CARGO_TOOLS=(
+  "nominal-cli:nomctl" # Nominal CLI; backs the nomconfig/nomp aliases
+)
+for entry in "${CARGO_TOOLS[@]}"; do
+  crate="${entry%%:*}" bin="${entry##*:}"
+  if have "$bin"; then
+    skip "$bin already installed"
+  else
+    cargo install "$crate" && ok "$bin (from $crate)"
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# 5b. Julia via juliaup
+#     juliaup rather than the `julia` formula for the same reason we use rustup
+#     over `brew install rust`: it multiplexes versions and `juliaup update`
+#     handles upgrades. The two brew formulae conflict -- both ship a `julia`
+#     binary -- so only one may be installed.
+# ---------------------------------------------------------------------------
+step "Julia / juliaup"
+if brew list --formula juliaup >/dev/null 2>&1; then
+  skip "juliaup already installed"
+elif brew list --formula julia >/dev/null 2>&1; then
+  warn "the 'julia' formula is installed and conflicts with juliaup; skipping"
+else
+  brew install juliaup && ok "juliaup installed"
+fi
+# juliaup ships no Julia of its own; `add release` fetches the current stable.
+# Version numbers only ever appear in the table's rows, never its header, so a
+# digit is a reliable "some channel is installed" test.
+if have juliaup; then
+  if juliaup status 2>/dev/null | grep -qE '[0-9]+\.[0-9]'; then
+    skip "a Julia channel is already installed"
+  else
+    juliaup add release && ok "Julia release channel"
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # 6. LazyVim
@@ -287,43 +365,49 @@ fi
 
 # ---------------------------------------------------------------------------
 # 7. Shell config
+#     ~/.zshrc gets exactly two source lines from us and nothing else. Oh My Zsh
+#     keeps owning that file (its installer rewrites it, and it holds the theme
+#     and plugin settings), while everything portable -- PATH, aliases, tool
+#     init, functions -- lives in this repo's zsh/rc.zsh.
+#
+#     The source line goes through ~/.config/zsh/rc.zsh rather than pointing at
+#     the repo directly, so .zshrc doesn't care where you cloned this.
+#
+#     Sourced near the end of .zshrc, which the eza aliases depend on: OMZ
+#     defines its own `ls`, and the last definition wins.
 # ---------------------------------------------------------------------------
-step "Writing shell config to ~/.zshrc"
+step "Shell config"
+if [[ -f "$SCRIPT_DIR/zsh/rc.zsh" ]]; then
+  link_file "$SCRIPT_DIR/zsh/rc.zsh" "$HOME/.config/zsh/rc.zsh" "rc.zsh"
+else
+  warn "no zsh/rc.zsh found next to this script ($SCRIPT_DIR)"
+fi
+
 append_once '' "$ZSHRC"
 append_once '# --- added by setup-mac.sh ---' "$ZSHRC"
-
-# PATH and environment
-append_once 'export PATH="$HOME/.local/bin:$PATH"' "$ZSHRC" # claude, pipx, etc.
-append_once 'export PATH="$HOME/.cargo/bin:$PATH"' "$ZSHRC"
-# pnpm puts globally-installed binaries in $PNPM_HOME/bin. Setting this by
-# hand rather than running `pnpm setup`, which appends its own block to
-# .zshrc and would duplicate on every re-run.
-append_once 'export PNPM_HOME="$HOME/Library/pnpm"' "$ZSHRC"
-append_once 'export PATH="$PNPM_HOME/bin:$PATH"' "$ZSHRC"
-append_once "export TRY_PATH=\"$TRY_PATH_DIR\"" "$ZSHRC"
-append_once 'export EDITOR="nvim"' "$ZSHRC"
-append_once 'alias vim="nvim"' "$ZSHRC"
-
-# eza aliases. These come after Oh My Zsh's own `ls` alias, so they win.
-#   ls  - grid, dirs first, icons        lsa - same, plus dotfiles
-#   lt  - tree, 2 levels deep            lta - same, plus dotfiles
-# The tree views skip .git and node_modules so `lta` stays readable.
-append_once "alias ls='eza --icons --group-directories-first'" "$ZSHRC"
-append_once "alias lsa='eza --icons --group-directories-first --all'" "$ZSHRC"
-append_once "alias lt='eza --icons --group-directories-first --tree --level=2 --ignore-glob=\".git|node_modules\"'" "$ZSHRC"
-append_once "alias lta='eza --icons --group-directories-first --tree --level=2 --all --ignore-glob=\".git|node_modules\"'" "$ZSHRC"
-append_once "alias ll='eza --icons --group-directories-first --long --git'" "$ZSHRC"
-
-# Tool init. Order matters: fzf binds Ctrl-R, then atuin takes it over.
-# Drop the atuin line if you'd rather keep fzf's history search.
-append_once 'source <(fzf --zsh)' "$ZSHRC"
-append_once 'export FZF_DEFAULT_COMMAND="fd --type f --hidden --exclude .git"' "$ZSHRC"
-append_once 'export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"' "$ZSHRC"
-append_once 'eval "$(zoxide init zsh)"' "$ZSHRC"
-append_once 'eval "$(direnv hook zsh)"' "$ZSHRC"
-append_once 'eval "$(atuin init zsh)"' "$ZSHRC"
-append_once 'eval "$(try init)"' "$ZSHRC"
+append_once '[[ -f "$HOME/.config/zsh/rc.zsh" ]] && source "$HOME/.config/zsh/rc.zsh"' "$ZSHRC"
+# Machine-specific values and secrets go here. Never tracked; sourced last so
+# it can override anything rc.zsh set.
+append_once '[[ -f "$HOME/.zshrc.local" ]] && source "$HOME/.zshrc.local"' "$ZSHRC"
 ok "done"
+
+# ---------------------------------------------------------------------------
+# 7b. Scripts from bin/
+#     Symlinked into ~/.local/bin (already on PATH via rc.zsh) so they travel
+#     with this repo instead of living only on the machine they were written on.
+# ---------------------------------------------------------------------------
+step "Scripts from bin/"
+if [[ -d "$SCRIPT_DIR/bin" ]]; then
+  shopt -s nullglob
+  for src in "$SCRIPT_DIR"/bin/*; do
+    [[ -f "$src" ]] || continue
+    chmod +x "$src"
+    link_file "$src" "$HOME/.local/bin/$(basename "$src")" "$(basename "$src")"
+  done
+  shopt -u nullglob
+else
+  skip "no bin/ directory"
+fi
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -345,6 +429,10 @@ cat <<EOF
     direnv    $(direnv version 2>/dev/null)
     gh        $(gh --version 2>/dev/null | head -1 | awk '{print $3}')
     gum       $(gum --version 2>/dev/null | awk '{print $3}')
+    bat       $(bat --version 2>/dev/null | awk '{print $2}')
+    nomctl    $(nomctl --version 2>/dev/null | awk '{print $2}')
+    julia     $(julia --version 2>/dev/null | awk '{print $3}')
+    jupyter   $(jupyter-lab --version 2>/dev/null)
     pnpm      $(pnpm --version 2>/dev/null)
     ruff      $(ruff --version 2>/dev/null | awk '{print $2}')
     try       $(try --version 2>/dev/null | head -1 || echo "installed")
@@ -356,8 +444,15 @@ cat <<EOF
     2. exec zsh              # or open a new terminal
     3. atuin import auto     # pull your existing shell history in
     4. gh auth login         # authenticate the GitHub CLI
-    5. nvim                  # then :LazyHealth to check the setup
-    6. ls / lsa / lt / lta, z <dir> to jump, try <name> for a scratch dir
+    5. nomp                  # set up a nomctl profile (needs a token)
+    6. nvim                  # then :LazyHealth to check the setup
+    7. ls / lsa / lt / lta, z <dir> to jump, try <name> for a scratch dir
+       rgv <pattern> to search-and-edit, jupyter-lab for notebooks
+
+  Shell config is zsh/rc.zsh in this repo, symlinked to ~/.config/zsh/rc.zsh.
+  Edit it there and the change is live next shell -- then commit and pull it
+  down on your other machines. Machine-specific or secret values belong in
+  ~/.zshrc.local, which is sourced after it and never tracked.
 
 EOF
 
