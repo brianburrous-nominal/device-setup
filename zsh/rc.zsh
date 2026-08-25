@@ -11,12 +11,36 @@
 # next shell -- no need to re-run the script.
 
 # ── PATH ─────────────────────────────────────────────────────────────────────
-export PATH="$HOME/.local/bin:$PATH" # claude, uv tools, this repo's bin/
-export PATH="$HOME/.cargo/bin:$PATH" # rustup toolchain + `cargo install` bins
+# Prepend a directory, but only if it exists and isn't already there. Straight
+# `PATH="$dir:$PATH"` lines duplicate every entry when this file is sourced
+# twice -- nesting a shell, or re-sourcing after an edit -- and leave a dead
+# entry on a machine that never ran, say, `cargo install`.
+add_path() {
+  [[ -d "$1" ]] || return 0
+  case ":$PATH:" in
+    *":$1:"*) ;;
+    *) PATH="$1:$PATH" ;;
+  esac
+}
+
+# add_path only declines to add a duplicate; it can't clean one that arrived in
+# the inherited environment, and by the time a terminal has nested a shell or
+# two there are several. -U keeps the first occurrence of each, so this dedupes
+# without disturbing precedence.
+typeset -U path PATH
+
 # pnpm keeps globally-installed binaries in $PNPM_HOME/bin. Set by hand rather
 # than via `pnpm setup`, which appends its own unguarded block to .zshrc.
 export PNPM_HOME="$HOME/Library/pnpm"
-export PATH="$PNPM_HOME/bin:$PATH"
+
+# Lowest priority last: each is prepended, so the FIRST line ends up deepest.
+# This ordering reproduces what the three plain prepends here used to produce
+# -- pnpm > cargo > .local/bin -- rather than quietly re-ranking them. Nothing
+# is currently shadowed either way; the three directories share no filenames.
+add_path "$HOME/.local/bin" # claude, uv tools, this repo's bin/ (apply, mdget)
+add_path "$HOME/.cargo/bin" # rustup toolchain + `cargo install` bins
+add_path "$PNPM_HOME/bin"
+export PATH
 
 # ── environment ──────────────────────────────────────────────────────────────
 export EDITOR="nvim"
@@ -44,6 +68,48 @@ alias ll='eza --icons --group-directories-first --long --git'
 # the profile-add flow, which is otherwise a long line of flags to remember.
 alias nomconfig='nomctl config profile'
 alias nomp='nomprofile'
+
+# `rm` moves things to the Trash instead of unlinking them. Nothing to install:
+# macOS 15 added /usr/bin/trash, which is exactly why Homebrew's `trash` and
+# `macos-trash` formulae are both keg-only now. Recoverable in Finder, "Put
+# Back" included.
+#
+# A function, not an alias, and rc.zsh is only sourced by interactive shells --
+# so scripts, subprocesses, and `command rm` all still get the real rm. Reach
+# for `command rm` when you mean it: something too big for the Trash volume, or
+# a path that has to be gone now rather than later.
+if (( $+commands[trash] )); then
+  rm() {
+    emulate -L zsh
+    local arg literal=0
+    local -a paths
+
+    # trash takes paths and nothing else -- it needs no -r (a directory moves
+    # whole) and no -f (it never prompts). Dropping rm's flags instead of
+    # forwarding them is what keeps `rm -rf build` working: trash would reject
+    # -rf as an unrecognized argument, and then still exit 0.
+    for arg in "$@"; do
+      if (( literal )); then
+        # Past a `--`, a leading dash belongs to the filename. trash has no
+        # `--` of its own, so say the same thing the way it does understand.
+        [[ "$arg" == -* ]] && arg="./$arg"
+        paths+=("$arg")
+      elif [[ "$arg" == "--" ]]; then
+        literal=1
+      elif [[ "$arg" == -?* ]]; then
+        continue
+      else
+        paths+=("$arg")   # a bare "-" is a filename to rm, so it lands here
+      fi
+    done
+
+    if (( ${#paths} == 0 )); then
+      print -u2 "rm: no paths given (flags are dropped; 'command rm' for the real thing)"
+      return 2
+    fi
+    trash "${paths[@]}"
+  }
+fi
 
 # ── tool init ────────────────────────────────────────────────────────────────
 # Order matters: fzf binds Ctrl-R, then atuin takes it over. Drop the atuin

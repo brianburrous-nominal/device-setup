@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+#
+# mdget — fetch a URL as markdown.
+#
+# r.jina.ai is a reader proxy: prefix any URL with it and you get the page's
+# main content back as markdown, with the nav, ads, cookie banners and script
+# tags stripped. Good for reading docs in the terminal, and for piping a page
+# into an LLM without 200KB of markup wrapped around it.
+#
+#   mdget https://example.com/docs
+#   mdget example.com/docs | bat -l md
+#   mdget https://example.com/docs | pbcopy
+#
+# Anonymous requests are rate-limited, and whole networks are blocked by ASN —
+# AT&T is one of them, so this needs a key on a home connection. Free keys are
+# at https://jina.ai/api-dashboard/; put it in ~/.zshrc.local as
+# `export JINA_API_KEY=...`. The 401 path below says so too.
+
+set -euo pipefail
+
+if [[ $# -eq 0 || "${1:-}" == -h || "${1:-}" == --help ]]; then
+  echo "usage: mdget <url>" >&2
+  exit 2
+fi
+
+url="$1"
+# The reader wants a full URL after its prefix, so supply a scheme when the
+# argument was pasted without one.
+[[ "$url" == *://* ]] || url="https://$url"
+
+auth=()
+[[ -z "${JINA_API_KEY:-}" ]] || auth=(-H "Authorization: Bearer $JINA_API_KEY")
+
+# Status captured alongside the body rather than with curl -f: the 401 body is
+# the one that explains what to do about it, and -f would throw it away.
+response="$(curl -sSL ${auth[@]+"${auth[@]}"} -w '\n%{http_code}' "https://r.jina.ai/$url")"
+status="${response##*$'\n'}"
+body="${response%$'\n'*}"
+
+if [[ "$status" == 200 ]]; then
+  printf '%s\n' "$body"
+  exit 0
+fi
+
+printf 'mdget: r.jina.ai returned HTTP %s\n' "$status" >&2
+if [[ "$status" == 401 && -z "${JINA_API_KEY:-}" ]]; then
+  cat >&2 <<'HINT'
+mdget: anonymous requests are blocked on this network. Get a free key at
+       https://jina.ai/api-dashboard/ and add it to ~/.zshrc.local:
+         export JINA_API_KEY=...
+HINT
+else
+  printf '%s\n' "$body" >&2
+fi
+exit 1

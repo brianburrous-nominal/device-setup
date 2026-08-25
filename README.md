@@ -33,6 +33,9 @@ every line added to a shell config is added only once.
 | Nominal | `nomctl` (the `nominal-cli` crate, via `cargo install`) |
 | Other | `try` for scratch directories, JetBrainsMono Nerd Font |
 
+Nothing is needed for `trash` — macOS 15 added `/usr/bin/trash`, which is why
+Homebrew's `trash` and `macos-trash` formulae are both keg-only now.
+
 It also links the shell config and the scripts in `bin/` into place — see
 [Shell config](#shell-config) below.
 
@@ -119,7 +122,7 @@ machines by `git pull` rather than by copy-paste.
 | Path in repo | Symlinked to | Holds |
 |---|---|---|
 | `zsh/rc.zsh` | `~/.config/zsh/rc.zsh` | PATH, exports, aliases, tool init, functions (`rgv`) |
-| `bin/*` | `~/.local/bin/*` | standalone scripts, e.g. `nomprofile` |
+| `bin/*` | `~/.local/bin/*` | standalone scripts — `apply`, `mdget`, `nomprofile` |
 
 `setup.sh` adds exactly two lines to `~/.zshrc` and nothing else:
 
@@ -160,6 +163,30 @@ git clone <this repo> ~/dev/setup && cd ~/dev/setup && ./setup.sh
 After that, syncing a shell change is `git pull` — nothing to re-run, the
 symlink already points at the updated file. Syncing a *package* change is
 `apply`, which does the pull for you.
+
+## Shell conveniences worth knowing
+
+**`rm` moves to the Trash.** It's a function in `rc.zsh` wrapping
+`/usr/bin/trash`, so it's recoverable in Finder with "Put Back". rm's flags are
+dropped rather than forwarded — `rm -rf build` still works, because `trash`
+needs neither `-r` (a directory moves whole) nor `-f` (it never prompts), and
+would otherwise reject `-rf` as an unrecognized argument. Interactive shells
+only: scripts, subprocesses, and `command rm` all still get the real `rm`. Use
+`command rm` when you mean it — something too big for the Trash volume, or a
+path that has to be gone now.
+
+**`mdget <url>`** fetches a page as markdown via the r.jina.ai reader proxy —
+nav, ads and script tags stripped. Good for reading docs in the terminal
+(`mdget url | bat -l md`) and for piping a page into an LLM without 200KB of
+markup around it. Anonymous requests are blocked by ASN on some networks, AT&T
+included, so put a free key from <https://jina.ai/api-dashboard/> in
+`~/.zshrc.local` as `export JINA_API_KEY=...`.
+
+**`add_path`** is how `rc.zsh` builds `PATH`: prepend, but only if the directory
+exists and isn't already there. Plain `PATH="$dir:$PATH"` lines duplicate every
+entry when the file is sourced twice, which a nested shell does routinely.
+`typeset -U path` alongside it cleans duplicates that arrived in the inherited
+environment, keeping the first occurrence so precedence survives.
 
 ## The nvim/ overlay
 
