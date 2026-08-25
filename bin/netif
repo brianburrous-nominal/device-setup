@@ -68,14 +68,37 @@ valid_ip() {
   return 0
 }
 
+# networksetup prints "(null)" / "none" / "" for an unset field — all mean unset
+norm() {
+  local v=${1## }
+  [[ -z $v || $v == "(null)" || $v == "none" || $v == "not set" ]] && v="-"
+  print -r -- "$v"
+}
+
+# persistent IPv4 config of a service, as "ip<TAB>mask<TAB>router".
+# Reads networksetup, not ifconfig: a manual config still exists when the link
+# is down, and that is the value the editor mutates.
+svc_config() {
+  local svc=$1
+  if [[ -z $svc ]]; then print -r -- $'-\t-\t-'; return; fi
+  networksetup -getinfo "$svc" 2>/dev/null | awk -F': ' '
+    /^IP address: /  { ip = $2 }
+    /^Subnet mask: / { mask = $2 }
+    /^Router: /      { router = $2 }
+    END {
+      printf "%s\t%s\t%s\n", ip, mask, router
+    }'
+}
+
 # ── interface table: dev, service, ip, mask, method, link state ───────────────
 build_cache() {
   local -A svc
   local line service="" dev
 
   while IFS= read -r line; do
-    if [[ $line == \(*\)\ * && $line != *"Hardware Port"* ]]; then
+    if [[ $line == \(<->\)\ * ]]; then
       service=${line#*\) }
+      service=${service#\*}          # (2) *Name  → disabled service
     elif [[ $line == *"Device: "* ]]; then
       dev=${line##*Device: }
       dev=${dev%\)*}
@@ -84,10 +107,13 @@ build_cache() {
   done < <(networksetup -listnetworkserviceorder 2>/dev/null)
 
   : > "$RAW"
+  local -A seen
   local info ip hexmask mask link_state service_name method rank
+  local live_ip live_mask cfg_ip cfg_mask cfg_router
   for dev in ${(f)"$(ifconfig -l 2>/dev/null | tr ' ' '\n')"}; do
     [[ -z $dev ]] && continue
     info=$(ifconfig "$dev" 2>/dev/null) || continue
+    seen[$dev]=1
 
     ip=""; hexmask=""
     IFS=$'\t' read -r ip hexmask <<< "$(print -r -- "$info" | awk '
@@ -99,19 +125,25 @@ build_cache() {
         print ip "\t" m; exit
       }')"
 
-    mask="-"
-    [[ -n $hexmask ]] && mask=$(hex2mask "$hexmask")
-    [[ -z $ip ]] && ip="-"
+    live_mask="-"
+    [[ -n $hexmask ]] && live_mask=$(hex2mask "$hexmask")
+    live_ip=$(norm "$ip")
 
     link_state=$(print -r -- "$info" | awk -F': ' '/status:/{print $2; exit}')
     [[ -z $link_state ]] && link_state="-"
 
     service_name=${svc[$dev]:-}
     method="-"
+    ip=$live_ip; mask=$live_mask
     if [[ -n $service_name ]]; then
       method=$(networksetup -getinfo "$service_name" 2>/dev/null \
                | awk '/Configuration$/{print $1; exit}')
       [[ -z $method ]] && method="-"
+      # a configured address wins over the live one: it survives a dead link
+      IFS=$'\t' read -r cfg_ip cfg_mask cfg_router <<< "$(svc_config "$service_name")"
+      cfg_ip=$(norm "$cfg_ip"); cfg_mask=$(norm "$cfg_mask")
+      [[ $cfg_ip   != "-" ]] && ip=$cfg_ip
+      [[ $cfg_mask != "-" ]] && mask=$cfg_mask
     fi
 
     if   [[ -n $service_name && $ip != "-" ]]; then rank=0
@@ -124,6 +156,22 @@ build_cache() {
       "$rank" "$dev" "$service_name" "$ip" "$mask" "$method" "$link_state" >> "$RAW"
   done
 
+  # A configured service whose hardware is absent — an unplugged USB adapter —
+  # is missing from `ifconfig -l` but networksetup still knows it and it is
+  # still editable. Without this it would vanish from the list entirely.
+  for dev in ${(k)svc}; do
+    [[ -n ${seen[$dev]:-} ]] && continue
+    service_name=${svc[$dev]}
+    method=$(networksetup -getinfo "$service_name" 2>/dev/null \
+             | awk '/Configuration$/{print $1; exit}')
+    [[ -z $method ]] && method="-"
+    IFS=$'\t' read -r cfg_ip cfg_mask cfg_router <<< "$(svc_config "$service_name")"
+    ip=$(norm "$cfg_ip"); mask=$(norm "$cfg_mask")
+    [[ $ip != "-" ]] && rank=0 || rank=2
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$rank" "$dev" "$service_name" "$ip" "$mask" "$method" "absent" >> "$RAW"
+  done
+
   sort -t$'\t' -k1,1n -k2,2 "$RAW" | cut -f2- > "$CACHE"
 }
 
@@ -131,7 +179,7 @@ lookup() { awk -F'\t' -v d="$1" '$1==d{print;exit}' "$CACHE"; }
 
 # ── detail rows: key, editable, label, value ──────────────────────────────────
 build_detail() {
-  local dev=$1 row svc ip mask method link_state router mac mtu dns info
+  local dev=$1 row svc ip mask method link_state router mac mtu dns info live
   row=$(lookup "$dev")
   [[ -z $row ]] && return 1
 
@@ -147,10 +195,14 @@ build_detail() {
   mtu=$(print -r -- "$info" | awk '{for(i=1;i<=NF;i++) if($i=="mtu"){print $(i+1); exit}}')
   [[ -z $mtu ]] && mtu="-"
 
+  # live address straight off the wire — differs from the configured one when
+  # the link is down or DHCP has no lease
+  live=$(print -r -- "$info" | awk '/[[:space:]]inet [0-9]/{print $2; exit}')
+  live=$(norm "$live")
+
   router="-"; dns="-"
   if [[ -n $svc ]]; then
-    router=$(networksetup -getinfo "$svc" 2>/dev/null | awk -F': ' '/^Router: /{print $2; exit}')
-    [[ -z $router || $router == "none" ]] && router="-"
+    router=$(norm "$(svc_config "$svc" | cut -f3)")
     dns=$(networksetup -getdnsservers "$svc" 2>/dev/null)
     if [[ -z $dns || $dns == *"aren't any DNS Servers"* ]]; then
       dns="-"
@@ -169,6 +221,7 @@ build_detail() {
     printf 'router\t%s\tRouter\t%s\n'     "$ed" "$router"
     printf 'dns\t%s\tDNS servers\t%s\n'   "$ed" "$dns"
     printf 'method\t0\tConfigured by\t%s\n' "$method"
+    printf 'live\t0\tActive IPv4\t%s\n'   "$live"
     printf 'service\t0\tService name\t%s\n' "${svc:-- (not configurable)}"
     printf 'device\t0\tBSD device\t%s\n'  "$dev"
     printf 'mac\t0\tMAC address\t%s\n'    "$mac"
@@ -217,7 +270,7 @@ edit_field() {
   fi
 
   ip=$(dfield ip 4);         [[ $ip     == "-" ]] && ip=""
-  mask=$(dfield mask 4);     [[ $mask   == "-" ]] && mask="255.255.255.0"
+  mask=$(dfield mask 4);     [[ $mask   == "-" ]] && mask=""
   router=$(dfield router 4); [[ $router == "-" ]] && router=""
 
   gum style --border rounded --padding "0 1" --border-foreground 39 \
@@ -248,10 +301,10 @@ edit_field() {
     ip)     new=$(gum input --header "IPv4 address" --value "$ip"     --placeholder "192.168.1.50") || return
             valid_ip "$new" || { oops "invalid IPv4 address: ${new:-<empty>}"; sleep 1.4; return }
             ip=$new ;;
-    mask)   new=$(gum input --header "Subnet mask"  --value "$mask"   --placeholder "255.255.255.0") || return
+    mask)   new=$(gum input --header "Subnet mask"  --value "${mask:-255.255.255.0}" --placeholder "255.255.255.0") || return
             valid_ip "$new" || { oops "invalid subnet mask: ${new:-<empty>}"; sleep 1.4; return }
             mask=$new ;;
-    router) new=$(gum input --header "Router (blank for none)" --value "$router" --placeholder "192.168.1.1") || return
+    router) new=$(gum input --header "Router (blank to clear)" --value "$router" --placeholder "192.168.1.1") || return
             if [[ -n $new ]] && ! valid_ip "$new"; then
               oops "invalid router: $new"; sleep 1.4; return
             fi
@@ -259,16 +312,41 @@ edit_field() {
   esac
 
   valid_ip "$ip" || { oops "no valid IPv4 address set for this service yet — set the IP first"; sleep 1.8; return }
+  [[ -z $mask ]] && mask="255.255.255.0"
+  valid_ip "$mask" || { oops "no valid subnet mask for this service — set the mask first"; sleep 1.8; return }
 
-  gum confirm "Apply to \"$svc\":  $ip / $mask${router:+  via $router}" || return
+  gum confirm "Apply to \"$svc\":  $ip / $mask${router:+  via $router}${router:-  ·  no router}" || return
 
-  if [[ -n $router ]]; then
-    sudo networksetup -setmanual "$svc" "$ip" "$mask" "$router"
-  else
-    sudo networksetup -setmanual "$svc" "$ip" "$mask"
+  # -setmanual takes exactly four arguments, but an empty router argument means
+  # "leave the router as it is" — NOT "clear it". Clearing needs a bounce
+  # through DHCP, which resets the router and leaves DNS untouched.
+  local prev_router bounced=0
+  prev_router=$(norm "$(svc_config "$svc" | cut -f3)")
+  if [[ -z $router && $prev_router != "-" ]]; then
+    sudo networksetup -setdhcp "$svc" && bounced=1
   fi
 
-  if (( $? == 0 )); then note "\"$svc\" is now $ip/$mask"; else oops "networksetup failed"; fi
+  if ! sudo networksetup -setmanual "$svc" "$ip" "$mask" "$router"; then
+    if (( bounced )); then
+      oops "networksetup failed — \"$svc\" is on DHCP now, re-set it manually"
+    else
+      oops "networksetup failed"
+    fi
+    sleep 1.8; return
+  fi
+
+  # networksetup can exit 0 without applying anything — confirm by reading back
+  local got_ip got_mask got_router
+  IFS=$'\t' read -r got_ip got_mask got_router <<< "$(svc_config "$svc")"
+  got_ip=$(norm "$got_ip"); got_mask=$(norm "$got_mask"); got_router=$(norm "$got_router")
+
+  local want_router=${router:--}
+  if [[ $got_ip == "$ip" && $got_mask == "$mask" && $got_router == "$want_router" ]]; then
+    note "\"$svc\" is now $ip/$mask${router:+ via $router}"
+  else
+    local shown_router=${got_router:#-}
+    oops "networksetup exited 0 but \"$svc\" reads back as $got_ip/$got_mask${shown_router:+ via $shown_router}"
+  fi
   sleep 1.4
 }
 

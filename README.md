@@ -248,6 +248,13 @@ the rows marked `+`, `ctrl-d` puts a service back on DHCP. Edits go through
 `networksetup`, so they're persistent and need sudo. Needs `fzf` and `gum`, both
 already declared in `lib/packages.sh`.
 
+The IPv4 rows show the *stored* config from `networksetup`, not the live address
+off `ifconfig`, so an unplugged adapter still shows the static IP you gave it and
+stays editable — a separate `Active IPv4` row carries the live value, and a
+service whose hardware is absent is listed with link state `absent`. Blanking the
+router bounces the service through DHCP, the only way `networksetup` will clear a
+router; `-setmanual` with an empty router argument keeps the old one.
+
 It re-invokes itself to render the preview pane, resolving its own path with
 `${0:A}` — which resolves symlinks, so it finds the repo copy rather than the
 `~/.local/bin` symlink and keeps working under the link.
