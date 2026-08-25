@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+#
+# identity — set up the SSH key, GitHub auth, and git identity on this machine.
+#
+# setup.sh runs this as one of its steps, so on a new machine there's nothing to
+# do by hand. It's a separate command as well because it's the one part of the
+# setup that can be needed again later: a new key, a re-auth after a token
+# expires, or a machine that was set up before this step existed.
+#
+#   identity           run every step; each is a no-op if already done
+#
+# Not part of `apply` on purpose. apply is the unattended path — no sudo, no
+# prompts — and every step here can ask you something.
+
+set -euo pipefail
+
+# Resolve through the ~/.local/bin symlink to find the repo, the same way apply
+# does: macOS only grew `readlink -f` recently, so walk the chain by hand.
+self="${BASH_SOURCE[0]}"
+while [[ -L "$self" ]]; do
+  self_dir="$(cd -P "$(dirname "$self")" && pwd)"
+  self="$(readlink "$self")"
+  [[ "$self" == /* ]] || self="$self_dir/$self"
+done
+SETUP_REPO_DIR="$(cd -P "$(dirname "$self")/.." && pwd)"
+
+case "${1:-}" in
+  -h | --help)
+    sed -n '3,15p' "$self" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+  "") ;;
+  *)
+    echo "usage: identity" >&2
+    exit 2
+    ;;
+esac
+
+# shellcheck source=lib/common.sh
+source "$SETUP_REPO_DIR/lib/common.sh"
+load_brew || true   # gh comes from Homebrew; not fatal if it isn't there yet
+# shellcheck source=lib/identity.sh
+source "$SETUP_REPO_DIR/lib/identity.sh"
+
+reconcile_identity
+
+step "Finished"
+echo

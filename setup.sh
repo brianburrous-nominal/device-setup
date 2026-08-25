@@ -27,6 +27,12 @@
 #
 # Usage:  chmod +x setup.sh && ./setup.sh
 #
+# On a machine that doesn't have this repo yet, don't start here -- start with
+# bootstrap.sh, which installs the Xcode Command Line Tools, clones the repo,
+# and then runs this script:
+#
+#   curl -fsSL https://raw.githubusercontent.com/brianburrous-nominal/device-setup/main/bootstrap.sh | bash
+#
 
 set -euo pipefail
 
@@ -141,6 +147,8 @@ load_cargo
 source "$SETUP_REPO_DIR/lib/packages.sh"
 # shellcheck source=lib/reconcile.sh
 source "$SETUP_REPO_DIR/lib/reconcile.sh"
+# shellcheck source=lib/identity.sh
+source "$SETUP_REPO_DIR/lib/identity.sh"
 
 install_missing_packages
 
@@ -226,6 +234,14 @@ link_shell_config
 link_repo_bin
 
 # ---------------------------------------------------------------------------
+# 9. Identity — SSH key, GitHub auth, git user.name/user.email
+#    Last, because it's the only interactive part: everything above can run
+#    unattended, and putting the prompts at the end means you can walk away for
+#    the long middle. Re-runnable on its own afterwards as `identity`.
+# ---------------------------------------------------------------------------
+reconcile_identity
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 step "Finished"
@@ -262,11 +278,13 @@ cat <<EOF
        without it every LazyVim icon renders as an empty box.
     2. exec zsh              # or open a new terminal
     3. atuin import auto     # pull your existing shell history in
-    4. gh auth login         # authenticate the GitHub CLI
-    5. nomp                  # set up a nomctl profile (needs a token)
-    6. nvim                  # then :LazyHealth to check the setup
-    7. ls / lsa / lt / lta, z <dir> to jump, try <name> for a scratch dir
+    4. nomp                  # set up a nomctl profile (needs a token)
+    5. nvim                  # then :LazyHealth to check the setup
+    6. ls / lsa / lt / lta, z <dir> to jump, try <name> for a scratch dir
        rgv <pattern> to search-and-edit, jupyter-lab for notebooks
+
+  Your SSH key, GitHub login, and git identity are already done -- the step
+  above set them up. Re-run just that part any time with \`identity\`.
 
   From here on the command is \`apply\`, not this script. It pulls the repo and
   installs anything newly declared in lib/packages.sh; \`apply -u\` upgrades

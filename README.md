@@ -3,22 +3,32 @@
 Bootstrap for a macOS dev machine, plus an `nvim/` overlay it copies over the
 LazyVim starter.
 
-Two commands, with a clear division of labour:
+On a machine with nothing on it, this is the whole command:
 
 ```sh
-git clone git@github.com:<you>/device-setup.git
-cd device-setup
-./setup.sh     # once, on a machine that has nothing
-apply          # from then on, from anywhere
+curl -fsSL https://raw.githubusercontent.com/brianburrous-nominal/device-setup/main/bootstrap.sh | bash
 ```
 
-`setup.sh` installs the things that can't install themselves — Homebrew, Oh My
-Zsh, rustup, the LazyVim starter — and needs sudo to do it. `apply` pulls this
-repo and installs anything newly declared. No sudo, no prompts, cheap when
-there's nothing to do. It's `bin/apply`, symlinked into `~/.local/bin`.
+From then on it's `apply`, from anywhere.
 
-Both are safe to re-run: every step checks for an existing install first, and
-every line added to a shell config is added only once.
+Three pieces, with a clear division of labour:
+
+| | |
+|---|---|
+| `bootstrap.sh` | gets the repo onto a bare machine: Xcode Command Line Tools, then the clone. Curled, because it runs before the repo exists. |
+| `setup.sh` | installs what can't install itself — Homebrew, Oh My Zsh, rustup, the LazyVim starter — and needs sudo. Ends with the identity step. |
+| `bin/apply` | reconciles a machine that already exists. No sudo, no prompts, cheap when there's nothing to do. |
+
+`bootstrap.sh` exists because of a bootstrapping problem `setup.sh` can't solve
+from inside the repo: `/usr/bin/git` on a bare Mac is a stub that opens a GUI
+dialog and fails, so there's no way to clone anything until the Command Line
+Tools are installed. It installs them headlessly — no dialog to click — clones,
+and hands off. It needs nothing but what macOS already ships, and is bash-3.2
+clean, because Homebrew's newer bash doesn't exist yet when it runs.
+
+All three are safe to re-run: every step checks for an existing install first,
+an existing checkout is updated rather than re-cloned, and every line added to a
+shell config is added only once.
 
 ## What it installs
 
@@ -80,6 +90,8 @@ absent on the desktop until someone remembers to re-run it.
 | `lib/packages.sh` | what should be installed. Declaration only; bash- and zsh-safe |
 | `lib/reconcile.sh` | how to install it, plus the symlinks and the nvim overlay |
 | `lib/common.sh` | output helpers shared by `setup.sh` and `apply` |
+| `lib/identity.sh` | SSH key, GitHub auth, git identity. Interactive; not used by `apply` |
+| `bootstrap.sh` | Command Line Tools + clone, for a machine without this repo |
 
 A few tools aren't one-line declarations and live in `lib/reconcile.sh` instead:
 `juliaup`, because "installed" has two levels there — the tool, then a channel.
@@ -122,7 +134,8 @@ machines by `git pull` rather than by copy-paste.
 | Path in repo | Symlinked to | Holds |
 |---|---|---|
 | `zsh/rc.zsh` | `~/.config/zsh/rc.zsh` | PATH, exports, aliases, tool init, functions (`rgv`) |
-| `bin/*` | `~/.local/bin/*` | standalone scripts — `apply`, `mdget`, `nomprofile` |
+| `bin/*` | `~/.local/bin/*` | standalone scripts — `apply`, `identity`, `mdget`, `nomprofile` |
+| `ssh/setup.conf` | `~/.ssh/config.d/setup.conf` | agent + keychain settings, pulled in by an `Include` |
 
 `setup.sh` adds exactly two lines to `~/.zshrc` and nothing else:
 
@@ -157,12 +170,58 @@ GitHub repo.
 ### Adding to another machine
 
 ```sh
-git clone <this repo> ~/dev/setup && cd ~/dev/setup && ./setup.sh
+curl -fsSL https://raw.githubusercontent.com/brianburrous-nominal/device-setup/main/bootstrap.sh | bash
 ```
+
+Clone somewhere other than `~/dev/setup` by setting `SETUP_DIR` first.
 
 After that, syncing a shell change is `git pull` — nothing to re-run, the
 symlink already points at the updated file. Syncing a *package* change is
 `apply`, which does the pull for you.
+
+## Identity — SSH key, GitHub, git
+
+The last step of `setup.sh`, and a command of its own afterwards:
+
+```sh
+identity           # every step; each is a no-op if already done
+```
+
+It generates an ed25519 key if there isn't one, loads it into the agent with the
+passphrase in the macOS keychain, links this repo's `ssh/setup.conf` into
+`~/.ssh/config.d/`, runs `gh auth login`, uploads the public key to GitHub, sets
+`user.name` / `user.email`, and switches this repo's remote from HTTPS to SSH.
+
+It runs last because it's the only interactive part — everything before it is
+unattended, so the prompts are all in one place at the end rather than
+scattered through a twenty-minute install. It is deliberately **not** part of
+`apply`, whose contract is no sudo and no prompts.
+
+**The git identity is guessed from this repo's own last commit**, not from the
+GitHub API. That sounds circular and isn't: it's your repo, you wrote those
+commits, and the machine has a full clone of them before this step runs. The
+API is the worse source — plenty of accounts expose neither a name nor an
+email, and the `@users.noreply.github.com` address that `gh` falls back to
+would quietly start a second identity that matches nothing you've authored
+before. The guess is only ever a *default*; you confirm it with return.
+
+### `~/.ssh/config`
+
+`ssh/setup.conf` is symlinked to `~/.ssh/config.d/setup.conf` and pulled in by
+an `Include` written to the **first line** of `~/.ssh/config`. Both details are
+load-bearing, and neither matches the intuition from shell config:
+
+- An `Include` is evaluated inside whatever `Host` block is in scope where it
+  appears. Appended to a file ending in a `Host myserver` block, it would apply
+  to `myserver` and nothing else — `ssh -vvv` logs the rest as `parse only`.
+- ssh keeps the **first** value it obtains for a keyword and ignores every later
+  one. That's the opposite of zsh, where the last definition of an alias wins.
+
+So unlike `~/.zshrc.local`, a host block lower down **cannot** override what
+`setup.conf` sets. To override one of these for a specific host, put that block
+*above* the `Include` line — there's a comment in the generated file saying so.
+(`IdentityFile` is the exception: it accumulates rather than being overwritten,
+so additional keys elsewhere are additive, with this one tried first.)
 
 ## Shell conveniences worth knowing
 
