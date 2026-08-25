@@ -134,7 +134,7 @@ machines by `git pull` rather than by copy-paste.
 | Path in repo | Symlinked to | Holds |
 |---|---|---|
 | `zsh/rc.zsh` | `~/.config/zsh/rc.zsh` | PATH, exports, aliases, tool init, functions (`rgv`) |
-| `bin/*` | `~/.local/bin/*` | standalone scripts — `apply`, `identity`, `mdget`, `nomprofile` |
+| `bin/*` | `~/.local/bin/*` | standalone scripts — `apply`, `identity`, `mdget`, `netif`, `nomprofile` |
 | `ssh/setup.conf` | `~/.ssh/config.d/setup.conf` | agent + keychain settings, pulled in by an `Include` |
 
 `setup.sh` adds exactly two lines to `~/.zshrc` and nothing else:
@@ -240,6 +240,17 @@ nav, ads and script tags stripped. Good for reading docs in the terminal
 markup around it. Anonymous requests are blocked by ASN on some networks, AT&T
 included, so put a free key from <https://jina.ai/api-dashboard/> in
 `~/.zshrc.local` as `export JINA_API_KEY=...`.
+
+**`netif`** is an interactive viewer and editor for macOS network interfaces —
+an fzf list of every device with its service, IPv4, mask, config method and link
+state, and a detail view per interface. `enter` copies a field, `ctrl-e` edits
+the rows marked `+`, `ctrl-d` puts a service back on DHCP. Edits go through
+`networksetup`, so they're persistent and need sudo. Needs `fzf` and `gum`, both
+already declared in `lib/packages.sh`.
+
+It re-invokes itself to render the preview pane, resolving its own path with
+`${0:A}` — which resolves symlinks, so it finds the repo copy rather than the
+`~/.local/bin` symlink and keeps working under the link.
 
 **`add_path`** is how `rc.zsh` builds `PATH`: prepend, but only if the directory
 exists and isn't already there. Plain `PATH="$dir:$PATH"` lines duplicate every

@@ -1,0 +1,342 @@
+#!/usr/bin/env zsh
+# netif — interactive macOS network interface viewer / editor
+#
+#   LIST VIEW      enter  open interface      ctrl-y  copy IPv4
+#                  ctrl-r refresh             esc     quit
+#
+#   DETAIL VIEW    enter  copy field value    ctrl-e  edit field (rows marked +)
+#                  ctrl-d set service to DHCP
+#                  esc or ctrl-b  back to list
+#
+# Requires: fzf, gum. Edits are persistent (networksetup) and need sudo.
+
+emulate -L zsh
+setopt no_nomatch
+set -uo pipefail
+
+SELF=${0:A}
+
+hex2mask() {
+  local h=${(L)${1#0x}}
+  [[ ${#h} -eq 8 && $h != *[^0-9a-f]* ]] || { print -n -- "-"; return }
+  printf '%d.%d.%d.%d' 0x${h[1,2]} 0x${h[3,4]} 0x${h[5,6]} 0x${h[7,8]}
+}
+
+# ── preview pane (script re-invokes itself) ───────────────────────────────────
+if [[ ${1:-} == --preview ]]; then
+  dev=${2:-}
+  [[ -z $dev ]] && exit 0
+  row=$(awk -F'\t' -v d="$dev" '$1==d{print;exit}' "${NETIF_CACHE:-/dev/null}")
+  svc=$(print -r -- "$row" | cut -f2)
+
+  print -r -- "  device   $dev"
+  print -r -- "  service  ${svc:-—  (no configurable service — read only)}"
+  if [[ -n $svc ]]; then
+    print -r -- "  ── networksetup ──"
+    networksetup -getinfo "$svc" 2>/dev/null | sed 's/^/  /'
+    print -r -- "  ── dns ──"
+    networksetup -getdnsservers "$svc" 2>/dev/null | sed 's/^/  /'
+  fi
+  print -r -- "  ── ifconfig ──"
+  ifconfig "$dev" 2>/dev/null | sed 's/^/  /'
+  exit 0
+fi
+
+# ── deps ──────────────────────────────────────────────────────────────────────
+for c in fzf gum networksetup ifconfig pbcopy; do
+  command -v $c >/dev/null 2>&1 || { print -u2 "netif: missing dependency: $c"; exit 1 }
+done
+
+CACHE=$(mktemp -t netif)    || exit 1
+RAW=$(mktemp -t netifraw)   || exit 1
+DETAIL=$(mktemp -t netifdet) || exit 1
+trap 'rm -f "$CACHE" "$RAW" "$DETAIL"' EXIT INT TERM
+
+note() { gum style --foreground 42  "+ $1"; }
+warn() { gum style --foreground 214 "! $1"; }
+oops() { gum style --foreground 196 "x $1"; }
+
+valid_ip() {
+  local -a o
+  o=(${(s:.:)1})
+  (( ${#o} == 4 )) || return 1
+  local p
+  for p in $o; do
+    [[ $p == <-> ]] || return 1
+    (( p >= 0 && p <= 255 )) || return 1
+  done
+  return 0
+}
+
+# ── interface table: dev, service, ip, mask, method, link state ───────────────
+build_cache() {
+  local -A svc
+  local line service="" dev
+
+  while IFS= read -r line; do
+    if [[ $line == \(*\)\ * && $line != *"Hardware Port"* ]]; then
+      service=${line#*\) }
+    elif [[ $line == *"Device: "* ]]; then
+      dev=${line##*Device: }
+      dev=${dev%\)*}
+      [[ -n $dev && -n $service ]] && svc[$dev]=$service
+    fi
+  done < <(networksetup -listnetworkserviceorder 2>/dev/null)
+
+  : > "$RAW"
+  local info ip hexmask mask link_state service_name method rank
+  for dev in ${(f)"$(ifconfig -l 2>/dev/null | tr ' ' '\n')"}; do
+    [[ -z $dev ]] && continue
+    info=$(ifconfig "$dev" 2>/dev/null) || continue
+
+    ip=""; hexmask=""
+    IFS=$'\t' read -r ip hexmask <<< "$(print -r -- "$info" | awk '
+      /[[:space:]]inet [0-9]/ {
+        for (i = 1; i <= NF; i++) {
+          if ($i == "inet")    ip = $(i+1)
+          if ($i == "netmask") m  = $(i+1)
+        }
+        print ip "\t" m; exit
+      }')"
+
+    mask="-"
+    [[ -n $hexmask ]] && mask=$(hex2mask "$hexmask")
+    [[ -z $ip ]] && ip="-"
+
+    link_state=$(print -r -- "$info" | awk -F': ' '/status:/{print $2; exit}')
+    [[ -z $link_state ]] && link_state="-"
+
+    service_name=${svc[$dev]:-}
+    method="-"
+    if [[ -n $service_name ]]; then
+      method=$(networksetup -getinfo "$service_name" 2>/dev/null \
+               | awk '/Configuration$/{print $1; exit}')
+      [[ -z $method ]] && method="-"
+    fi
+
+    if   [[ -n $service_name && $ip != "-" ]]; then rank=0
+    elif [[ $ip != "-" ]];                    then rank=1
+    elif [[ -n $service_name ]];              then rank=2
+    else                                           rank=3
+    fi
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$rank" "$dev" "$service_name" "$ip" "$mask" "$method" "$link_state" >> "$RAW"
+  done
+
+  sort -t$'\t' -k1,1n -k2,2 "$RAW" | cut -f2- > "$CACHE"
+}
+
+lookup() { awk -F'\t' -v d="$1" '$1==d{print;exit}' "$CACHE"; }
+
+# ── detail rows: key, editable, label, value ──────────────────────────────────
+build_detail() {
+  local dev=$1 row svc ip mask method link_state router mac mtu dns info
+  row=$(lookup "$dev")
+  [[ -z $row ]] && return 1
+
+  svc=$(print -r -- "$row"        | cut -f2)
+  ip=$(print -r -- "$row"         | cut -f3)
+  mask=$(print -r -- "$row"       | cut -f4)
+  method=$(print -r -- "$row"     | cut -f5)
+  link_state=$(print -r -- "$row" | cut -f6)
+
+  info=$(ifconfig "$dev" 2>/dev/null)
+  mac=$(print -r -- "$info" | awk '/[[:space:]]ether /{print $2; exit}')
+  [[ -z $mac ]] && mac="-"
+  mtu=$(print -r -- "$info" | awk '{for(i=1;i<=NF;i++) if($i=="mtu"){print $(i+1); exit}}')
+  [[ -z $mtu ]] && mtu="-"
+
+  router="-"; dns="-"
+  if [[ -n $svc ]]; then
+    router=$(networksetup -getinfo "$svc" 2>/dev/null | awk -F': ' '/^Router: /{print $2; exit}')
+    [[ -z $router || $router == "none" ]] && router="-"
+    dns=$(networksetup -getdnsservers "$svc" 2>/dev/null)
+    if [[ -z $dns || $dns == *"aren't any DNS Servers"* ]]; then
+      dns="-"
+    else
+      dns=${dns//$'\n'/ }
+    fi
+  fi
+
+  local ed=0
+  [[ -n $svc ]] && ed=1
+
+  : > "$DETAIL"
+  {
+    printf 'ip\t%s\tIPv4 address\t%s\n'   "$ed" "$ip"
+    printf 'mask\t%s\tSubnet mask\t%s\n'  "$ed" "$mask"
+    printf 'router\t%s\tRouter\t%s\n'     "$ed" "$router"
+    printf 'dns\t%s\tDNS servers\t%s\n'   "$ed" "$dns"
+    printf 'method\t0\tConfigured by\t%s\n' "$method"
+    printf 'service\t0\tService name\t%s\n' "${svc:-- (not configurable)}"
+    printf 'device\t0\tBSD device\t%s\n'  "$dev"
+    printf 'mac\t0\tMAC address\t%s\n'    "$mac"
+    printf 'mtu\t0\tMTU\t%s\n'            "$mtu"
+    printf 'link\t0\tLink status\t%s\n'   "$link_state"
+  } >> "$DETAIL"
+  return 0
+}
+
+dfield() { awk -F'\t' -v k="$1" -v c="$2" '$1==k{print $c; exit}' "$DETAIL"; }
+
+# ── actions ───────────────────────────────────────────────────────────────────
+copy_value() {
+  local label=$1 value=$2
+  if [[ -z $value || $value == "-" || $value == "- (not configurable)" ]]; then
+    warn "$label is empty — nothing to copy"
+  else
+    print -rn -- "$value" | pbcopy
+    note "copied $label: $value"
+  fi
+  sleep 0.6
+}
+
+set_dhcp() {
+  local dev=$1 svc
+  svc=$(lookup "$dev" | cut -f2)
+  if [[ -z $svc ]]; then
+    warn "$dev has no network service — nothing to configure"; sleep 1.2; return
+  fi
+  if gum confirm "Set \"$svc\" ($dev) back to DHCP?"; then
+    if sudo networksetup -setdhcp "$svc"; then note "\"$svc\" set to DHCP"
+    else oops "failed to set DHCP on \"$svc\""; fi
+    sleep 1.2
+  fi
+}
+
+edit_field() {
+  local dev=$1 key=$2 svc ip mask router val new
+  svc=$(lookup "$dev" | cut -f2)
+
+  if [[ -z $svc ]]; then
+    warn "$dev has no network service — networksetup can't edit it"; sleep 1.4; return
+  fi
+  if [[ $key != (ip|mask|router|dns) ]]; then
+    warn "$(dfield "$key" 3) is read-only"; sleep 1.2; return
+  fi
+
+  ip=$(dfield ip 4);         [[ $ip     == "-" ]] && ip=""
+  mask=$(dfield mask 4);     [[ $mask   == "-" ]] && mask="255.255.255.0"
+  router=$(dfield router 4); [[ $router == "-" ]] && router=""
+
+  gum style --border rounded --padding "0 1" --border-foreground 39 \
+    "$svc  ($dev)  ·  editing $(dfield "$key" 3)"
+
+  if [[ $key == dns ]]; then
+    val=$(dfield dns 4); [[ $val == "-" ]] && val=""
+    new=$(gum input --header "DNS servers (space separated, blank to clear)" \
+                    --value "$val" --placeholder "1.1.1.1 8.8.8.8") || return
+    local -a servers
+    servers=(${=new})
+    local s
+    for s in $servers; do
+      valid_ip "$s" || { oops "invalid DNS server: $s"; sleep 1.4; return }
+    done
+    gum confirm "Set DNS for \"$svc\" to ${new:-none}?" || return
+    if (( ${#servers} )); then
+      sudo networksetup -setdnsservers "$svc" $servers
+    else
+      sudo networksetup -setdnsservers "$svc" empty
+    fi
+    if (( $? == 0 )); then note "DNS updated"; else oops "networksetup failed"; fi
+    sleep 1.2
+    return
+  fi
+
+  case $key in
+    ip)     new=$(gum input --header "IPv4 address" --value "$ip"     --placeholder "192.168.1.50") || return
+            valid_ip "$new" || { oops "invalid IPv4 address: ${new:-<empty>}"; sleep 1.4; return }
+            ip=$new ;;
+    mask)   new=$(gum input --header "Subnet mask"  --value "$mask"   --placeholder "255.255.255.0") || return
+            valid_ip "$new" || { oops "invalid subnet mask: ${new:-<empty>}"; sleep 1.4; return }
+            mask=$new ;;
+    router) new=$(gum input --header "Router (blank for none)" --value "$router" --placeholder "192.168.1.1") || return
+            if [[ -n $new ]] && ! valid_ip "$new"; then
+              oops "invalid router: $new"; sleep 1.4; return
+            fi
+            router=$new ;;
+  esac
+
+  valid_ip "$ip" || { oops "no valid IPv4 address set for this service yet — set the IP first"; sleep 1.8; return }
+
+  gum confirm "Apply to \"$svc\":  $ip / $mask${router:+  via $router}" || return
+
+  if [[ -n $router ]]; then
+    sudo networksetup -setmanual "$svc" "$ip" "$mask" "$router"
+  else
+    sudo networksetup -setmanual "$svc" "$ip" "$mask"
+  fi
+
+  if (( $? == 0 )); then note "\"$svc\" is now $ip/$mask"; else oops "networksetup failed"; fi
+  sleep 1.4
+}
+
+# ── detail view ───────────────────────────────────────────────────────────────
+detail_view() {
+  local dev=$1 out key line fkey label value svc
+
+  while true; do
+    build_cache
+    build_detail "$dev" || return
+    svc=$(lookup "$dev" | cut -f2)
+
+    out=$(awk -F'\t' '{
+            printf "%s\t%s %-15s %s\n", $1, ($2 == "1" ? "+" : " "), $3, $4
+          }' "$DETAIL" \
+        | fzf --reverse --height=90% --info=inline \
+              --delimiter='\t' --with-nth=2 --nth=2 \
+              --prompt="$dev ❯ " \
+              --header="< back (esc)   $dev${svc:+  ·  $svc}"$'\n''enter copy · ctrl-e edit (+ rows) · ctrl-d dhcp · ctrl-r refresh' \
+              --header-first \
+              --expect=enter,ctrl-y,ctrl-e,ctrl-d,ctrl-b,ctrl-r \
+              --preview="NETIF_CACHE=$CACHE ${(q)SELF} --preview ${(q)dev}" \
+              --preview-window="right,52%,border-left")
+
+    [[ -z $out ]] && return              # esc → back to list
+
+    key=${out%%$'\n'*}
+    line=${out#*$'\n'}
+    fkey=${line%%$'\t'*}
+
+    case $key in
+      ctrl-b)        return ;;
+      ctrl-r)        continue ;;
+      enter|ctrl-y)  copy_value "$(dfield "$fkey" 3)" "$(dfield "$fkey" 4)" ;;
+      ctrl-e)        edit_field "$dev" "$fkey" ;;
+      ctrl-d)        set_dhcp "$dev" ;;
+    esac
+  done
+}
+
+# ── list view ─────────────────────────────────────────────────────────────────
+while true; do
+  build_cache
+
+  header=$(printf "%-10s %-24s %-16s %-16s %-7s %s" \
+           "DEVICE" "SERVICE" "IPV4" "SUBNET MASK" "CONFIG" "STATUS")
+
+  out=$(awk -F'\t' '{
+          printf "%-10s %-24s %-16s %-16s %-7s %s\n",
+                 $1, ($2 == "" ? "-" : $2), $3, $4, $5, $6
+        }' "$CACHE" \
+      | fzf --reverse --height=90% --info=inline \
+            --prompt="iface ❯ " \
+            --header="$header"$'\n''enter open · ctrl-y copy ip · ctrl-r refresh · esc quit' \
+            --header-first \
+            --expect=enter,ctrl-y,ctrl-r \
+            --preview="NETIF_CACHE=$CACHE ${(q)SELF} --preview {1}" \
+            --preview-window="right,52%,border-left")
+
+  [[ -z $out ]] && break                 # esc → quit
+
+  key=${out%%$'\n'*}
+  sel=${out#*$'\n'}
+  dev=${sel%% *}
+
+  case $key in
+    ctrl-r) continue ;;
+    ctrl-y) copy_value "IPv4 address" "$(lookup "$dev" | cut -f3)" ;;
+    enter)  detail_view "$dev" ;;
+  esac
+done
