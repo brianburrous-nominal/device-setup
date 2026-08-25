@@ -277,6 +277,19 @@ a bare IP, which is read as `/24`). `--json` emits the same rows as objects for
 scripting, `-A` skips the sweep and just prints the current ARP cache (instant),
 `-n` skips hostname lookups.
 
+The table styles itself for whoever is reading it. On a terminal: addresses
+right-aligned so the octets line up, an underlined header that doubles as the
+rule beneath itself, MACs and vendors held back in grey so the eye lands on the
+address and hostname, and `VIA` coloured by what answered — green for a ping
+reply, amber for ARP-only, magenta for this machine. A dash, and `(randomized)`
+where a vendor would be, are dimmed: both mean "nothing to know", not a value.
+Columns are measured from the data, and if the result is wider than the terminal
+the vendor column goes first (the MAC beside it already implies the vendor) and
+only then is the hostname truncated. Redirect it to a pipe or a file and all of
+that drops away — plain text, every column in full, nothing to strip before
+`awk` sees it. `--no-color`, `NO_COLOR` and `TERM=dumb` all force the plain form
+on a terminal too, and `COLUMNS` overrides the detected width.
+
 Discovery is a parallel ICMP sweep — 256 pings in flight by default — followed
 by a read of the ARP cache. The sweep is really there to *force* ARP resolution:
 a device that drops pings still has to answer the ARP who-has to stay on the

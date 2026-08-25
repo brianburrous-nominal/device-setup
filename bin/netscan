@@ -37,6 +37,7 @@ RESOLVE=true
 SWEEP=true
 JSON=false
 VENDOR=true
+USE_COLOR=true
 IFACE=""
 TARGET=""
 MAX_HOSTS=4096  # a /20; past this a sweep is the wrong tool
@@ -61,6 +62,7 @@ usage: netscan [options] [target]
   -n, --no-resolve  skip hostname lookups
   -A, --arp-only    don't sweep, just report the current ARP cache
       --no-vendor   skip MAC vendor lookup
+      --no-color    plain text, even on a terminal
       --json        JSON array on stdout (needs jq)
   -h, --help        this
 USAGE
@@ -74,6 +76,7 @@ while [[ $# -gt 0 ]]; do
     -n | --no-resolve) RESOLVE=false; shift ;;
     -A | --arp-only) SWEEP=false; shift ;;
     --no-vendor) VENDOR=false; shift ;;
+    --no-color) USE_COLOR=false; shift ;;
     --json) JSON=true; shift ;;
     -h | --help) usage; exit 0 ;;
     -*) die "unknown option: $1 (try --help)" ;;
@@ -88,11 +91,38 @@ done
 [[ "$TIMEOUT" =~ ^[0-9]+$ && "$TIMEOUT" -gt 0 ]] || die "--timeout must be a positive integer (ms)"
 [[ "$JOBS" =~ ^[0-9]+$ && "$JOBS" -gt 0 ]] || die "--jobs must be a positive integer"
 
+# Styling is for humans reading a terminal: a pipe, a file, a dumb TERM,
+# NO_COLOR (https://no-color.org) or --no-color all get plain text, so the
+# output stays parseable by whatever is downstream. stdout and stderr are
+# decided separately — the table and the progress notes don't necessarily go
+# to the same place.
+COLOR=0
+DIM=""
+RESET=""
+TERM_WIDTH=0
+plain=false
+[[ "$USE_COLOR" == true && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]] || plain=true
+if [[ "$plain" == false ]]; then
+  [[ -t 1 ]] && COLOR=1
+  if [[ -t 2 ]]; then
+    DIM=$'\033[2m'
+    RESET=$'\033[0m'
+  fi
+fi
+# Only a terminal has a width worth fitting; a pipe gets every column in full.
+# COLUMNS wins if it is exported, which is both the convention and the only way
+# to test the narrow path without a real resize.
+if [[ -t 1 ]]; then
+  TERM_WIDTH="${COLUMNS:-}"
+  [[ "$TERM_WIDTH" =~ ^[0-9]+$ ]] || TERM_WIDTH="$(tput cols 2>/dev/null)"
+  [[ "$TERM_WIDTH" =~ ^[0-9]+$ ]] || TERM_WIDTH=0
+fi
+
 for c in ping arp; do
   command -v "$c" >/dev/null 2>&1 || die "missing dependency: $c"
 done
 if [[ "$RESOLVE" == true ]] && ! command -v dig >/dev/null 2>&1; then
-  printf '%s: dig not found — hostnames will be blank\n' "$SELF_NAME" >&2
+  printf '%s%s: dig not found — hostnames will be blank%s\n' "$DIM" "$SELF_NAME" "$RESET" >&2
   RESOLVE=false
 fi
 if [[ "$JSON" == true ]]; then
@@ -249,8 +279,8 @@ if [[ "$SWEEP" == true ]]; then
   # -W is milliseconds, -t is a whole-second ceiling on the run, so it has to
   # be rounded up or a --timeout above 1000ms would be cut short by it.
   ping_secs=$(((TIMEOUT + 999) / 1000))
-  printf '%s: sweeping %s host addresses on %s (%s)...\n' \
-    "$SELF_NAME" "$HOST_COUNT" "$CIDR" "${IFACE:-?}" >&2
+  printf '%s%s: sweeping %s host addresses on %s (%s)...%s\n' \
+    "$DIM" "$SELF_NAME" "$HOST_COUNT" "$CIDR" "${IFACE:-?}" "$RESET" >&2
   started=0
   for ((n = FIRST_INT; n <= LAST_INT; n++)); do
     ip="$(int2ip "$n")"
@@ -456,32 +486,110 @@ if [[ "$JSON" == true ]]; then
     <"$TMP/rows.tsv"
 else
   if ((found == 0)); then
-    printf '%s: nothing found on %s\n' "$SELF_NAME" "$CIDR" >&2
+    printf '%s%s: nothing found on %s%s\n' "$DIM" "$SELF_NAME" "$CIDR" "$RESET" >&2
   else
-    # Widths from the data, so a long hostname or vendor doesn't wrap the row.
-    awk -F'\t' -v show_vendor="$([[ -n "$OUI_DB" ]] && echo 1 || echo 0)" '
+    # Column widths come from the data, so a long hostname or vendor can't wrap
+    # a row. Colour is applied after padding is measured — an escape sequence
+    # occupies no columns, and awk's %-*s would count it if it were inside.
+    awk -F'\t' \
+      -v color="$COLOR" \
+      -v show_vendor="$([[ -n "$OUI_DB" ]] && echo 1 || echo 0)" \
+      -v term_width="$TERM_WIDTH" '
+      function pad(s, w,   n) {
+        n = w - length(s)
+        return (n > 0) ? s sprintf("%" n "s", "") : s
+      }
+      function lpad(s, w,   n) {
+        n = w - length(s)
+        return (n > 0) ? sprintf("%" n "s", "") s : s
+      }
+      function trunc(s, w) {
+        return (length(s) <= w) ? s : substr(s, 1, w - 1) "…"
+      }
+      # "(randomized)" is the absence of a vendor, like a dash, so it reads as
+      # one rather than competing with the real names.
+      function paint_vendor(s) {
+        if (!color) return s
+        if (s == "-" || s == "(randomized)") return DIM s RESET
+        return C_VEN s RESET
+      }
+      # A dash means "nothing found", not a value — dim so the eye skips it.
+      function paint(s, c) {
+        if (!color) return s
+        if (s ~ /^-[ ]*$/) return DIM s RESET
+        if (c == "") return s
+        return c s RESET
+      }
+      BEGIN {
+        if (color) {
+          RESET = "\033[0m"; DIM = "\033[2m"
+          HDR   = "\033[1;4m"                 # bold + underline: the rule *is* the header
+          C_IP  = "\033[38;5;39m"             # same blue netif uses for accents
+          C_HOST = ""
+          C_MAC = "\033[38;5;245m"
+          C_VEN = "\033[38;5;250m"
+          C_ICMP = "\033[38;5;42m"            # answered: green
+          C_ARP  = "\033[38;5;214m"           # ARP only: amber, i.e. filtering ICMP
+          C_SELF = "\033[38;5;170m"           # this machine
+        }
+      }
       {
         rows[NR] = $0
-        if (length($1) > w1) w1 = length($1)
-        if (length($2) > w2) w2 = length($2)
-        if (length($3) > w3) w3 = length($3)
+        if (length($1) > w_ip)   w_ip = length($1)
+        if (length($2) > w_host) w_host = length($2)
+        if (length($3) > w_mac)  w_mac = length($3)
+        if (length($4) > w_ven)  w_ven = length($4)
       }
       END {
-        if (w1 < 4) w1 = 4          # IPV4
-        if (w2 < 8) w2 = 8          # HOSTNAME
-        if (w3 < 3) w3 = 3          # MAC
-        fmt = "%-" w1 "s  %-" w2 "s  %-" w3 "s  %-4s"
-        if (show_vendor) fmt = fmt "  %s"
-        if (show_vendor) printf fmt "\n", "IPV4", "HOSTNAME", "MAC", "VIA", "VENDOR"
-        else             printf fmt "\n", "IPV4", "HOSTNAME", "MAC", "VIA"
+        if (w_ip < 4)   w_ip = 4
+        if (w_host < 8) w_host = 8
+        if (w_mac < 3)  w_mac = 3
+        if (w_ven < 6)  w_ven = 6
+        w_via = 4
+        gap = 2
+
+        # Fit the terminal rather than wrapping every row into two. The vendor
+        # column goes first because the MAC beside it already implies it; the
+        # hostname is truncated only if dropping vendor was not enough. Both
+        # only apply to a terminal — a pipe gets every column in full.
+        if (term_width > 0) {
+          total = w_ip + w_host + w_mac + w_via + gap * 3
+          if (show_vendor && total + gap + w_ven > term_width) show_vendor = 0
+          if (total > term_width) {
+            w_host = w_host - (total - term_width)
+            if (w_host < 8) w_host = 8
+          }
+        }
+
+        head = pad("IPV4", w_ip) "  " pad("HOSTNAME", w_host) "  " \
+               pad("MAC", w_mac) "  " pad("VIA", w_via)
+        if (show_vendor) head = head "  " pad("VENDOR", w_ven)
+        if (color) {
+          # The underline runs through the gaps and the trailing padding too,
+          # so the header doubles as the rule under itself.
+          print HDR head RESET
+        } else {
+          sub(/[ \t]+$/, "", head)
+          print head
+        }
+
         for (i = 1; i <= NR; i++) {
           split(rows[i], f, "\t")
-          if (show_vendor) printf fmt "\n", f[1], f[2], f[3], f[5], f[4]
-          else             printf fmt "\n", f[1], f[2], f[3], f[5]
+          via = f[5]
+          c_via = (via == "icmp") ? C_ICMP : (via == "arp") ? C_ARP : C_SELF
+          line = paint(lpad(f[1], w_ip), C_IP) "  " \
+                 paint(pad(trunc(f[2], w_host), w_host), C_HOST) "  " \
+                 paint(pad(f[3], w_mac), C_MAC) "  " \
+                 paint(pad(via, w_via), c_via)
+          if (show_vendor) line = line "  " paint_vendor(f[4])
+          # Padding on the last column would only be trailing whitespace.
+          sub(/[ \t]+$/, "", line)
+          print line
         }
       }' "$TMP/rows.tsv"
   fi
   [[ "$found" -eq 1 ]] && plural="" || plural="s"
-  printf '%s: %s device%s on %s%s in %ss\n' \
-    "$SELF_NAME" "$found" "$plural" "$CIDR" "${IFACE:+ ($IFACE)}" "$elapsed" >&2
+  printf '%s%s: %s device%s on %s%s in %ss%s\n' \
+    "$DIM" "$SELF_NAME" "$found" "$plural" "$CIDR" "${IFACE:+ ($IFACE)}" \
+    "$elapsed" "$RESET" >&2
 fi
